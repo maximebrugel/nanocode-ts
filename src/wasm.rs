@@ -652,6 +652,8 @@ struct ChildToolContext {
     origin: Option<String>,
     output_token_budget: usize,
     #[serde(default)]
+    resumed: bool,
+    #[serde(default)]
     turn_id: Option<String>,
 }
 
@@ -2009,22 +2011,26 @@ fn execute(command: Command) -> Executed {
             context,
         } => executed(async move {
             let remote = ready()?.remote_children()?;
-            let output = remote
-                .call_tool(
-                    &session_id,
-                    nanocode::ChildToolCall {
-                        call_id: &context.call_id,
-                        host_context: context.origin.as_deref(),
-                        input: nanocode::tool_contract::ToolInput::Function(input),
-                        instruction_revision: context.instruction_revision,
-                        name: &name,
-                        output_budget: context.output_token_budget,
-                        turn_id: context.turn_id.as_deref(),
-                    },
-                )
-                .await
-                .map_err(text)?;
-            serde_json::to_value(output.into_wire().map_err(text)?).map_err(text)
+            let call = nanocode::ChildToolCall {
+                call_id: &context.call_id,
+                host_context: context.origin.as_deref(),
+                input: nanocode::tool_contract::ToolInput::Function(input),
+                instruction_revision: context.instruction_revision,
+                name: &name,
+                output_budget: context.output_token_budget,
+                turn_id: context.turn_id.as_deref(),
+            };
+            let output = if context.resumed {
+                remote.recover_tool(&session_id, call).await.map_err(text)?
+            } else {
+                Some(remote.call_tool(&session_id, call).await.map_err(text)?)
+            };
+            match output {
+                Some(output) => {
+                    serde_json::to_value(output.into_wire().map_err(text)?).map_err(text)
+                }
+                None => Ok(Value::Null),
+            }
         }),
         Command::CompletionOrigin { request_id } => executed(async move {
             let origin = match &ready()?.subagents {

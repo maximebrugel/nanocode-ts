@@ -211,6 +211,25 @@ impl WireTool {
     }
 }
 
+impl WireTool {
+    fn request(&self, input: Value, context: &ToolContext<'_>, resumed: bool) -> Value {
+        json!({
+            "op": "child_tool",
+            "name": self.definition.name(),
+            "input": input,
+            "context": {
+                "session_id": context.session_id(),
+                "call_id": context.call_id(),
+                "turn_id": context.turn_id(),
+                "origin": context.host_context(),
+                "instruction_revision": context.instruction_revision(),
+                "output_token_budget": context.output_token_budget(),
+                "resumed": resumed,
+            },
+        })
+    }
+}
+
 impl Tool for WireTool {
     fn definition(&self) -> ToolDefinition {
         self.definition.clone()
@@ -235,25 +254,36 @@ impl Tool for WireTool {
                 Ok(input) => input,
                 Err(error) => return Ok(ToolOutput::error(error.to_string())),
             };
-            let request = json!({
-                "op": "child_tool",
-                "name": self.definition.name(),
-                "input": input,
-                "context": {
-                    "session_id": context.session_id(),
-                    "call_id": context.call_id(),
-                    "turn_id": context.turn_id(),
-                    "origin": context.host_context(),
-                    "instruction_revision": context.instruction_revision(),
-                    "output_token_budget": context.output_token_budget(),
-                },
-            });
-            Ok(match call(request).await {
+            Ok(match call(self.request(input, &context, false)).await {
                 Ok(wire) => serde_json::from_value::<ToolOutputWire>(wire)
                     .and_then(ToolOutput::from_wire)
                     .unwrap_or_else(|error| ToolOutput::error(error.to_string())),
                 Err(error) => ToolOutput::error(failed(&error).to_string()),
             })
         })
+    }
+
+    fn recover<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        input: nanocode::tool_contract::ToolInput,
+        context: ToolContext<'life1>,
+    ) -> Option<HostFuture<'async_trait, Option<ToolOutput>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        let input: Value = input.decode_json().ok()?;
+        let request = self.request(input, &context, true);
+        Some(Box::pin(async move {
+            match call(request).await.ok()? {
+                Value::Null => None,
+                wire => Some(
+                    serde_json::from_value::<ToolOutputWire>(wire)
+                        .and_then(ToolOutput::from_wire)
+                        .unwrap_or_else(|error| ToolOutput::error(error.to_string())),
+                ),
+            }
+        }))
     }
 }

@@ -947,7 +947,7 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
     let coalesce = Duration::from_millis(config.event_coalesce_ms);
     let log = log(&config.scope).await?;
     if config.remote_children {
-        log.settle_durably();
+        log.settle_durably_within(coalesce);
     }
     let store = nanocode::session_store(log.store())
         .map_err(text)?

@@ -131,6 +131,7 @@ export type SessionDescriptor = SessionAuthority & {
   brief_final?: boolean
   brief_finish?: boolean
   clearing_cache_floors?: boolean
+  codesign?: boolean
   escalate?: Contracts.Escalate
   fold_finish?: boolean
   finish_ambiguity?: boolean
@@ -1159,6 +1160,8 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           )
         if (input.subagents !== undefined && typeof input.subagents !== 'boolean')
           return json({ error: 'subagents must be a boolean' }, 400)
+        if (input.codesign !== undefined && typeof input.codesign !== 'boolean')
+          return json({ error: 'codesign must be a boolean' }, 400)
         if (
           input.deadline !== undefined &&
           !(
@@ -1286,6 +1289,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
         const claudeOrchestrationKey = `claude_orchestration:${scope}`
         const orchestrationKey = `codex_orchestration:${scope}`
         const subagentsKey = `subagents:${scope}`
+        const codesignKey = `codesign:${scope}`
         this.prime(
           [
             [
@@ -1395,6 +1399,16 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           )
             return json({ error: 'session subagents is immutable; create a new session' }, 409)
           descriptor.subagents = input.subagents ?? sessionSubagents
+          const storedCodesign = this.metadata.get(codesignKey)
+          const sessionCodesign = storedCodesign === undefined ? undefined : storedCodesign === 'true'
+          const boundCodesign = sessionCodesign ?? (initialized ? true : undefined)
+          if (
+            boundCodesign !== undefined &&
+            input.codesign !== undefined &&
+            input.codesign !== boundCodesign
+          )
+            return json({ error: 'session codesign is immutable; create a new session' }, 409)
+          descriptor.codesign = input.codesign ?? sessionCodesign
           descriptor.deadline = input.deadline
           descriptor.escalate = input.escalate
           descriptor.tool_result_clearing = input.tool_result_clearing
@@ -1489,6 +1503,8 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
               this.metadata.insert(orchestrationKey, descriptor.codex_orchestration ?? 'code_mode')
               if (descriptor.subagents !== undefined)
                 this.metadata.insert(subagentsKey, String(descriptor.subagents))
+              if (descriptor.codesign !== undefined)
+                this.metadata.insert(codesignKey, String(descriptor.codesign))
               this.metadata.insert(executorKey, executor)
               this.sessionId(scope, descriptor.session_id || this.claimPrewarmed(scope, descriptor))
             })
@@ -2386,6 +2402,7 @@ ${input.request_id}`
         ...(codexOptions(descriptor) === undefined
           ? []
           : [{ codex_options: codexOptions(descriptor) }]),
+        ...(descriptor.codesign === false ? [{ codesign: false }] : []),
       ])
     }
 
@@ -2639,6 +2656,7 @@ ${input.request_id}`
               ...(descriptor.codex_orchestration === undefined
                 ? {}
                 : { codex_orchestration: descriptor.codex_orchestration }),
+              ...(descriptor.codesign === undefined ? {} : { codesign: descriptor.codesign }),
               ...(descriptor.deadline === undefined ? {} : { deadline: descriptor.deadline }),
               ...(descriptor.escalate === undefined ? {} : { escalate: descriptor.escalate }),
               ...(descriptor.tool_result_clearing === undefined
@@ -3876,6 +3894,7 @@ ${input.request_id}`
       const orchestration = this.metadata.get('codex_orchestration:' + scope) as
         | Contracts.CodexOrchestration
         | undefined
+      const codesign = this.metadata.get('codesign:' + scope)
       const subagents = this.metadata.get('subagents:' + scope)
       return {
         ...base,
@@ -3886,6 +3905,7 @@ ${input.request_id}`
         ...(payer === undefined ? {} : { payer }),
         ...(claudeOrchestration === undefined ? {} : { claude_orchestration: claudeOrchestration }),
         ...(orchestration === undefined ? {} : { codex_orchestration: orchestration }),
+        ...(codesign === undefined ? {} : { codesign: codesign === 'true' }),
         ...(subagents === undefined ? {} : { subagents: subagents === 'true' }),
         subscription: served(
           provider,

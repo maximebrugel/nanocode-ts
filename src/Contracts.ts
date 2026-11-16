@@ -121,6 +121,7 @@ export type AgentConfiguration = {
   brief_final?: boolean
   brief_finish?: boolean
   clearing_cache_floors?: boolean
+  codesign?: boolean
   escalate?: Escalate
   fold_finish?: boolean
   finish_ambiguity?: boolean

@@ -69,7 +69,7 @@ const lanes: { [name: string]: Lane } = {
   },
   codex: {
     env: (home) => ({ ...base, BENCH_KEY: 'fixture-key', CODEX_HOME: home + '/.codex', HOME: home }),
-    ready: 'bench/model',
+    ready: 'Ask Codex to do anything',
     setup: (home, cwd) => {
       Fs.mkdirSync(home + '/.codex', { recursive: true })
       Fs.writeFileSync(home + '/.codex/config.toml', 'approval_policy = "never"\ncheck_for_update_on_startup = false\nsandbox_mode = "danger-full-access"\n\n[analytics]\nenabled = false\n\n[feedback]\nenabled = false\n\n[projects."' + cwd + '"]\ntrust_level = "trusted"\n')

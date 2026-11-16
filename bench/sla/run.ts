@@ -404,7 +404,8 @@ const builds = new Map(names.map((name) => {
 const fx = live ? { child: { kill: () => true }, url: '' } : await fixture()
 const all: Sample[] = []
 Fs.mkdirSync(root, { recursive: true })
-for (let index = 0; index < samples; index++) {
+const offset = Number(arg('offset', '0'))
+for (let index = offset; index < offset + samples; index++) {
   for (const name of index % 2 === 0 ? names : [...names].reverse()) {
     const lane = laneOf(name)
     const result = mode === 'exec' ? await execSample(name, lane, fx.url, index) : mode === 'resume' ? await resumeSample(name, lane, fx.url, index) : await tuiSample(name, lane, fx.url, index)

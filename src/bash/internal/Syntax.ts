@@ -262,9 +262,22 @@ class Parser {
     return this.src.startsWith(text, this.pos)
   }
 
+  // Hand-rolled /^(\[\[|\]\]|[{}!]|[a-z]+)(?=[\s;&|()<>]|$)/ at pos: it runs before every
+  // command, and slicing the rest of the source for a regex costs more than the scan.
   reserved(): string | undefined {
-    const match = this.src.slice(this.pos).match(/^(\[\[|\]\]|[{}!]|[a-z]+)(?=[\s;&|()<>]|$)/)
-    return match?.[1]
+    const src = this.src
+    const pos = this.pos
+    const c = src.charCodeAt(pos)
+    let end: number
+    if ((c === 91 || c === 93) && src.charCodeAt(pos + 1) === c) end = pos + 2
+    else if (c === 123 || c === 125 || c === 33) end = pos + 1
+    else if (c >= 97 && c <= 122) {
+      end = pos + 1
+      for (let code = src.charCodeAt(end); code >= 97 && code <= 122; code = src.charCodeAt(end))
+        end++
+    } else return undefined
+    if (end < src.length && !boundary(src.charCodeAt(end))) return undefined
+    return src.slice(pos, end)
   }
 
   eat(word: string) {
@@ -612,7 +625,7 @@ class Parser {
       if (this.redirect(command.redirects)) continue
       if (c === '\n' || c === ';' || c === '|' || c === '&' || c === ')' || c === '(') break
       const declaring = command.words.length > 0 && isDeclaration(command.words[0])
-      if (!command.words.length || declaring) {
+      if ((!command.words.length || declaring) && nameStart(this.src.charCodeAt(this.pos))) {
         const assign = this.src
           .slice(this.pos)
           .match(/^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=/)
@@ -775,8 +788,11 @@ class Parser {
         push(parts, this.src.slice(this.pos, end), false)
         this.pos = end
       } else {
-        push(parts, c, false)
-        this.pos++
+        // A run of plain characters joins the word in one slice, not one string per character.
+        const start = this.pos++
+        const src = this.src
+        while (this.pos < src.length && plain(src.charCodeAt(this.pos))) this.pos++
+        push(parts, start + 1 === this.pos ? c : src.slice(start, this.pos), false)
       }
     }
     return parts
@@ -1034,6 +1050,30 @@ function isDeclaration(word: Word | Assign): boolean {
     !word[0].quoted &&
     DECLARATIONS.has(word[0].value)
   )
+}
+
+// Characters that end a plain run in wordParts: META, quoting, expansions and extglob openers.
+// Every other character, including non-ASCII, is literal there.
+const SPECIAL_CODES = new Uint8Array(128)
+for (const c of META + '\\\'"$`?*+@!') SPECIAL_CODES[c.charCodeAt(0)] = 1
+
+function plain(code: number): boolean {
+  return code >= 128 || SPECIAL_CODES[code] === 0
+}
+
+function nameStart(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95
+}
+
+const WHITESPACE = /\s/
+
+// What may follow a reserved word: whitespace (as \s matches it) or a metacharacter.
+function boundary(code: number): boolean {
+  if (code === 59 || code === 38 || code === 124 || code === 40 || code === 41) return true
+  if (code === 60 || code === 62) return true
+  if (code === 32 || (code >= 9 && code <= 13)) return true
+  if (code < 128) return false
+  return WHITESPACE.test(String.fromCharCode(code))
 }
 
 function push(parts: Part[], value: string, quoted: boolean) {

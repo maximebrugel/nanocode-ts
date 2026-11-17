@@ -2060,7 +2060,6 @@ const tr: CommandHandler = streaming(async (ctx) => {
   const simple = [...list1, ...set2].every((c) => c.length === 1 && !/[\uD800-\uDFFF]/.test(c))
   const convert = (input: string): string => {
     if (simple && (!complement || !/[\uD800-\uDFFF]/.test(input))) {
-      // Small inputs use sparse caches; the dense 64K tables pay off only on bulk text.
       seen += input.length
       if (map === undefined && seen > TR_DENSE) {
         map = new Int32Array(65536).fill(-2)

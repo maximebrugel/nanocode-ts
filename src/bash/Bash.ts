@@ -181,7 +181,6 @@ export async function create(options: create.Options = {}): Promise<Bash> {
     for (const name of ['python', 'python3', 'pip', 'pip3'])
       if (!options.commands?.[name]) commands.delete(name)
   let calls = 0
-  // The variables bash sets in every shell, built once rather than on every exec.
   const shellDefaults: [string, string[]][] = Object.entries({
     BASH: '/bin/bash',
     BASH_VERSION: '5.2.21(1)-release',

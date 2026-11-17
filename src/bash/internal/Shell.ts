@@ -938,9 +938,6 @@ export class Runner {
     return runner
   }
 
-  // A pipeline stage that only runs a host command on literal words reads the shell's state
-  // and never writes it, so it borrows the parent's state instead of cloning it. Anything that
-  // could write (a builtin or function run through ctx.run) takes its own copy first.
   #borrow(): Runner {
     const runner = this.fork(this.state)
     runner.#borrowed = true

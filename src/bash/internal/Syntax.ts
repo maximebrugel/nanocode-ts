@@ -103,8 +103,6 @@ type Sourced = Word & { [SOURCE]?: Source }
 
 const NO_EDITS: Edit[] = []
 
-// Each word carries its source text for printing (declare -f, type). A symbol property is much
-// cheaper per word than a WeakMap entry, and parsing allocates a word for every argument.
 export const sources = {
   get(word: Word): Source | undefined {
     return (word as Sourced)[SOURCE]
@@ -262,8 +260,6 @@ class Parser {
     return this.src.startsWith(text, this.pos)
   }
 
-  // Hand-rolled /^(\[\[|\]\]|[{}!]|[a-z]+)(?=[\s;&|()<>]|$)/ at pos: it runs before every
-  // command, and slicing the rest of the source for a regex costs more than the scan.
   reserved(): string | undefined {
     const src = this.src
     const pos = this.pos
@@ -788,7 +784,6 @@ class Parser {
         push(parts, this.src.slice(this.pos, end), false)
         this.pos = end
       } else {
-        // A run of plain characters joins the word in one slice, not one string per character.
         const start = this.pos++
         const src = this.src
         while (this.pos < src.length && plain(src.charCodeAt(this.pos))) this.pos++
@@ -1052,8 +1047,6 @@ function isDeclaration(word: Word | Assign): boolean {
   )
 }
 
-// Characters that end a plain run in wordParts: META, quoting, expansions and extglob openers.
-// Every other character, including non-ASCII, is literal there.
 const SPECIAL_CODES = new Uint8Array(128)
 for (const c of META + '\\\'"$`?*+@!') SPECIAL_CODES[c.charCodeAt(0)] = 1
 
@@ -1067,7 +1060,6 @@ function nameStart(code: number): boolean {
 
 const WHITESPACE = /\s/
 
-// What may follow a reserved word: whitespace (as \s matches it) or a metacharacter.
 function boundary(code: number): boolean {
   if (code === 59 || code === 38 || code === 124 || code === 40 || code === 41) return true
   if (code === 60 || code === 62) return true

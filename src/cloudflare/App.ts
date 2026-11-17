@@ -4246,7 +4246,7 @@ ${input.request_id}`
     }
 
     private releaseConnections(): void {
-      for (const scope of [...this.spares.keys()]) this.dropSpare(scope)
+      for (const scope of this.spares.keys()) this.dropSpare(scope)
       for (const [scope, runtime] of this.residents()) {
         if (runtime.remote) this.retire(scope, runtime)
         else runtime.releaseConnections()

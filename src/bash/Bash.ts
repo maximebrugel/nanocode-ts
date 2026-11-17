@@ -362,9 +362,8 @@ export async function create(options: create.Options = {}): Promise<Bash> {
       const state = new Shell.State()
       state.cwd = directory
       const vars = state.vars
-      for (const name in env) {
-        if (!Object.hasOwn(env, name)) continue
-        vars.set(name, [env[name]!])
+      for (const [name, value] of Object.entries(env)) {
+        vars.set(name, [value])
         state.exported.add(name)
       }
       if (execOptions.env)

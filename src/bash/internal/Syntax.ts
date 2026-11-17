@@ -97,7 +97,22 @@ export type Source = { text: string; start: number; edits: Edit[] }
 
 export type Heredoc = { delimiter: string; quoted: boolean; strip: boolean; body: string }
 
-export const sources = new WeakMap<Word, Source>()
+const SOURCE = Symbol('source')
+
+type Sourced = Word & { [SOURCE]?: Source }
+
+const NO_EDITS: Edit[] = []
+
+// Each word carries its source text for printing (declare -f, type). A symbol property is much
+// cheaper per word than a WeakMap entry, and parsing allocates a word for every argument.
+export const sources = {
+  get(word: Word): Source | undefined {
+    return (word as Sourced)[SOURCE]
+  },
+  set(word: Word, source: Source) {
+    ;(word as Sourced)[SOURCE] = source
+  },
+}
 
 export const texts = new WeakMap<object, string | string[]>()
 
@@ -686,7 +701,7 @@ class Parser {
   word(regex = false): Word {
     const start = this.pos
     const outer = this.edits
-    this.edits = []
+    this.edits = NO_EDITS
     const parts = this.wordParts(regex)
     sources.set(parts, { edits: this.edits, start, text: this.src.slice(start, this.pos) })
     this.edits = outer
@@ -751,6 +766,7 @@ class Parser {
         }
         if (this.done()) this.fail()
         this.pos++
+        if (this.edits === NO_EDITS) this.edits = []
         this.edits.push({ end: this.pos, start, value })
         push(parts, value, true)
       } else if (c === '$' || c === '`') parts.push(this.dollar(false))
@@ -840,6 +856,7 @@ class Parser {
       if (this.done()) this.unmatched(')', this.end())
       if (!this.starts(')')) this.fail()
       this.pos++
+      if (this.edits === NO_EDITS) this.edits = []
       this.edits.push({ body, end: this.pos, start })
       return { type: 'command', body, quoted }
     }

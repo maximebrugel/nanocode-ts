@@ -5,6 +5,7 @@ import {
   type ClipboardEvent,
   type DragEvent,
   useCallback,
+  useContext,
   useMemo,
   useRef,
   useState,
@@ -12,7 +13,7 @@ import {
 import * as Format from '../client/internal/Format.ts'
 import type * as Transport from '../client/Transport.ts'
 import { Image } from './Image.tsx'
-import { useConfig, usePart } from './Provider.tsx'
+import { ConfigContext, usePart } from './Provider.tsx'
 
 export type PendingAttachment = {
   id: string
@@ -93,10 +94,10 @@ function pastedName(file: File): string {
 }
 
 export function useAttachments(
-  options: { max?: number; accept?: readonly string[] } = {},
+  options: { max?: number; accept?: readonly string[]; files?: Transport.Files | undefined } = {},
 ): Attachments {
-  const config = useConfig()
-  const files = config.files
+  const config = useContext(ConfigContext)
+  const files = options.files ?? config?.files
   const max = Math.min(options.max ?? files?.maxFiles ?? maxAttachments, maxAttachments)
   const accept = options.accept ?? defaultAccept
   const [items, setItems] = useState<PendingAttachment[]>([])

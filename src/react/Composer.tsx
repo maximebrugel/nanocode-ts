@@ -5,6 +5,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
   useId,
   useRef,
@@ -12,7 +13,7 @@ import {
 } from 'react'
 import type * as Transport from '../client/Transport.ts'
 import { AttachmentList, type Attachments, useAttachments } from './Attachments.tsx'
-import { usePart, useSend } from './Provider.tsx'
+import { ConfigContext, usePart } from './Provider.tsx'
 
 export type ComposerModel = { id: string; label: string; detail?: string | undefined }
 
@@ -75,8 +76,9 @@ export function useComposer(options: useComposer.Options = {}): Composer {
   const attachments = useAttachments({
     ...(options.maxAttachments !== undefined ? { max: options.maxAttachments } : {}),
     ...(options.accept ? { accept: options.accept } : {}),
+    ...(options.files ? { files: options.files } : {}),
   })
-  const { send } = useSend()
+  const config = useContext(ConfigContext)
   const models = options.models ?? []
   const [prompt, setPrompt] = useState('')
   const [picked, setPicked] = useState(options.defaultModel)
@@ -216,7 +218,7 @@ export function useComposer(options: useComposer.Options = {}): Composer {
     if (!canSubmit) return
     const ready = attachments.ready
     if (options.onSubmit) options.onSubmit({ prompt: text, attachments: ready, model: model?.id })
-    else void send(text, ready)
+    else void config?.send(text, ready)
     setPrompt('')
     attachments.clear()
   }
@@ -280,6 +282,7 @@ export declare namespace useComposer {
     onSubmit?(turn: Submission): void
     maxAttachments?: number | undefined
     accept?: readonly string[] | undefined
+    files?: Transport.Files | undefined
     disabled?: boolean | undefined
   }
   type Submission = {

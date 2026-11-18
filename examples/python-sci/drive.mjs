@@ -10,6 +10,10 @@ const header = Buffer.from(
   JSON.stringify({
     argv: ['t.py'],
     cwd: '/workspace',
+    env: {},
+    memory: 1 << 30,
+    stdin: '',
+    timeMs: 120000,
     files: files.map(([path, bytes]) => [path, bytes.length]),
   }),
 )

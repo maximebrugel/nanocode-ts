@@ -180,6 +180,21 @@ mkdirSync(join(out, 'assets'), { recursive: true })
 const half = Math.ceil(image.length / 2)
 writeFileSync(join(out, 'assets', 'python.data.0'), image.subarray(0, half))
 writeFileSync(join(out, 'assets', 'python.data.1'), image.subarray(half))
+const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+writeFileSync(
+  join(out, 'package.json'),
+  JSON.stringify(
+    {
+      name: 'nanocode-ts-polars',
+      version,
+      license: 'MIT OR Apache-2.0',
+      files: ['python.wasm', 'python.data', 'assets'],
+      exports: { './python.wasm': './python.wasm', './python.data': './python.data' },
+    },
+    null,
+    2,
+  ) + '\n',
+)
 console.log(
   'python.wasm ' + module.length + ' bytes, python.data ' + image.length + ' bytes in ' + out,
 )

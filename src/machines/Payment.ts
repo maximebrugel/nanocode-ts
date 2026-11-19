@@ -1,5 +1,12 @@
 import type { Session } from 'mppx/tempo'
+import type { Address, Hex } from 'viem'
 import * as Mcp from './Mcp.ts'
+
+export type Allowance = {
+  budget: string
+  calls: number
+  windowMs: number
+}
 
 export type Inference = 'apiKey' | 'tempo'
 
@@ -37,7 +44,14 @@ export type Policy = {
   tools: Tools
 }
 
-export const required = 'tempo_wallet_required'
+export type Sponsor = {
+  account?: Address | undefined
+  allowance: Allowance
+  deposit?: Deposit | undefined
+  key: Hex
+}
+
+export const required = 'tempo_id_required'
 
 export const unlocked: Record<string, string> = {
   gateway: 'gateway storage, AI and compute',
@@ -60,7 +74,19 @@ export function unlocks(servers: readonly Mcp.Server[], scripts = true) {
 }
 
 export function explanation(servers: readonly Mcp.Server[], scripts = true) {
-  return `${required}: this tool is paid with Tempo machine payments, and the user has not connected a Tempo Wallet, so nothing was paid or done. Tell the user to connect their Tempo Wallet with the Connect button in the chat, which unlocks ${unlocks(servers, scripts)}; then retry the call. Do not retry it before they connect.`
+  return `${required}: this tool is paid with Tempo machine payments, and the user has not signed in with Tempo ID, so nothing was paid or done. Tell the user to sign in with Tempo ID with the Connect button in the chat, which unlocks ${unlocks(servers, scripts)}; then retry the call. Do not retry it before they connect.`
+}
+
+export function exceeded(servers: readonly Mcp.Server[], options: exceeded.Options) {
+  const { allowance, scripts = true } = options
+  return `${required}: this deployment pays for each visitor's paid tool calls up to ${allowance.budget} USD and ${allowance.calls} calls every ${allowance.windowMs / 60_000} minutes, and it did not pay for this one, so nothing was paid or done. Tell the user to sign in with Tempo ID with the Connect button in the chat, which unlocks ${unlocks(servers, scripts)}; then retry the call. Do not retry it before they connect.`
+}
+
+export declare namespace exceeded {
+  type Options = {
+    allowance: Allowance
+    scripts?: boolean | undefined
+  }
 }
 
 export function needsWallet(text: string | undefined) {
@@ -80,7 +106,12 @@ export function locked(servers: readonly Mcp.Server[], options: locked.Options =
       )
     if (!mcp) return response
     const call = await Mcp.call(input, init)
-    if (!call || !(await Mcp.outcome(response)).required) return response
+    const result = call ? await Mcp.outcome(response) : undefined
+    if (!result?.required) return response
+    const paid = await options.sponsor?.pay(result.challenges)
+    if (paid) return paid
+    const served = await options.fallback?.(input, init)
+    if (served) return served
     const id = await response
       .clone()
       .text()
@@ -91,16 +122,48 @@ export function locked(servers: readonly Mcp.Server[], options: locked.Options =
     return Response.json({
       id,
       jsonrpc: '2.0',
-      result: { content: [{ text: explanation(servers, scripts), type: 'text' }], isError: true },
+      result: {
+        content: [
+          {
+            text: options.sponsor
+              ? exceeded(servers, { allowance: options.sponsor.allowance, scripts })
+              : explanation(servers, scripts),
+            type: 'text',
+          },
+        ],
+        isError: true,
+      },
     })
   }
 }
 
 export declare namespace locked {
   type Options = {
+    fallback?:
+      | ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response | undefined>)
+      | undefined
     fetch?: typeof fetch | undefined
     scripts?: boolean | undefined
+    sponsor?: Sponsoring | undefined
   }
+
+  type Sponsoring = {
+    allowance: Allowance
+    pay(challenges: readonly Mcp.Challenge[]): Promise<Response | undefined>
+  }
+}
+
+export function price(challenges: readonly Mcp.Challenge[]): bigint | undefined {
+  if (!challenges.length) return undefined
+  let highest = 0n
+  for (const challenge of challenges) {
+    const amount = challenge.request?.amount
+    const metered = challenge.intent === 'session' && challenge.request?.unitType === 'request'
+    if (!amount || !/^\d+$/.test(amount) || (challenge.intent !== 'charge' && !metered))
+      return undefined
+    if (BigInt(amount) > highest) highest = BigInt(amount)
+  }
+  return highest
 }
 
 const receiptEvent = /^event: ?payment-receipt\r?$/m

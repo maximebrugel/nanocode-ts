@@ -1989,6 +1989,8 @@ const TR_ESCAPES: Record<string, string> = {
   v: '\v',
 }
 
+const TR_DENSE = 1 << 14
+
 function trSet(spec: string): string[] {
   const out: string[] = []
   const text = bytewise(
@@ -2038,7 +2040,10 @@ const tr: CommandHandler = streaming(async (ctx) => {
   let previous = ''
   let last = -1
   let map: Int32Array | undefined
-  let squeezable: Uint8Array | undefined
+  let squeezable: Int8Array | undefined
+  const sparse = new Map<number, number>()
+  const sparseSqueeze = new Map<number, number>()
+  let seen = 0
   const squeeze = f.has('s')
     ? new Set(f.has('d') || second === undefined ? (second === undefined ? [...set1] : set2) : set2)
     : undefined
@@ -2055,20 +2060,34 @@ const tr: CommandHandler = streaming(async (ctx) => {
   const simple = [...list1, ...set2].every((c) => c.length === 1 && !/[\uD800-\uDFFF]/.test(c))
   const convert = (input: string): string => {
     if (simple && (!complement || !/[\uD800-\uDFFF]/.test(input))) {
-      if (!map || !squeezable) {
-        map = new Int32Array(65536)
-        squeezable = new Uint8Array(65536)
-        for (let code = 0; code < 65536; code++) {
-          const value = translate(String.fromCharCode(code))
-          map[code] = value === undefined ? -1 : value.charCodeAt(0)
-          if (value !== undefined && squeezes(value)) squeezable[map[code]] = 1
-        }
+      seen += input.length
+      if (map === undefined && seen > TR_DENSE) {
+        map = new Int32Array(65536).fill(-2)
+        squeezable = new Int8Array(65536).fill(-1)
+        for (const [code, value] of sparse) map[code] = value
+        for (const [code, value] of sparseSqueeze) squeezable[code] = value
       }
       const codes = new Uint16Array(input.length)
       let n = 0
       for (let i = 0; i < input.length; i++) {
-        const value = map[input.charCodeAt(i)]
-        if (value < 0 || (value === last && squeezable[value])) continue
+        const code = input.charCodeAt(i)
+        let value = map !== undefined ? map[code] : (sparse.get(code) ?? -2)
+        if (value === -2) {
+          const translated = translate(String.fromCharCode(code))
+          value = translated === undefined ? -1 : translated.charCodeAt(0)
+          if (map !== undefined) map[code] = value
+          else sparse.set(code, value)
+        }
+        if (value < 0) continue
+        if (value === last) {
+          let can = squeezable !== undefined ? squeezable[value] : (sparseSqueeze.get(value) ?? -1)
+          if (can < 0) {
+            can = squeezes(String.fromCharCode(value)) ? 1 : 0
+            if (squeezable !== undefined) squeezable[value] = can
+            else sparseSqueeze.set(value, can)
+          }
+          if (can) continue
+        }
         codes[n++] = value
         last = value
       }
@@ -2940,6 +2959,33 @@ const base64: CommandHandler = async (ctx) => {
   return 0
 }
 
+const cksum: CommandHandler = async (ctx) => {
+  let status = 0
+  for (const operand of ctx.args.length ? ctx.args : ['-']) {
+    let bytes: Uint8Array
+    try {
+      bytes = operand === '-' ? encode(ctx.stdin.read()) : await ctx.fs.read(ctx.resolve(operand))
+    } catch (error) {
+      if (!(error instanceof FsError)) throw error
+      ctx.stderr.write('cksum: ' + readFailure(ctx, operand, error) + '\n')
+      status = 1
+      continue
+    }
+    let crc = 0
+    const step = (byte: number) => {
+      crc ^= byte << 24
+      for (let bit = 0; bit < 8; bit++) crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1
+    }
+    for (const byte of bytes) step(byte)
+    for (let length = bytes.length; length > 0; length = Math.floor(length / 256))
+      step(length & 0xff)
+    ctx.stdout.write(
+      (~crc >>> 0) + ' ' + bytes.length + (ctx.args.length ? ' ' + operand : '') + '\n',
+    )
+  }
+  return status
+}
+
 function digest(algorithm: string): CommandHandler {
   return checksum(
     async (bytes) =>
@@ -3530,6 +3576,7 @@ export const textCommands: Record<string, CommandHandler> = {
   sha256sum: digest('SHA-256'),
   sha1sum: digest('SHA-1'),
   sha512sum: digest('SHA-512'),
+  cksum,
   expr,
   fold,
   column,

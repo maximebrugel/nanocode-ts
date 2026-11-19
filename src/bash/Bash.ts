@@ -163,19 +163,124 @@ export async function create(options: create.Options = {}): Promise<Bash> {
         ...options.env,
       }
   const limits = { ...defaultLimits, ...options.limits }
-  const commands = new Map(
+  const commands: Map<string, Command.Handler> = new Map(
     Object.entries({
       ...builtinCommands,
       ...(options.github ? gitCommands(options.github) : {}),
       ...(options.wasm ? wasmCommands(options.wasm) : {}),
-      ...(options.python ? pythonCommands(options.python, options.psh) : {}),
+      ...(options.python
+        ? pythonCommands(options.python, options.psh, {
+            has: (name): boolean => commands.has(name) || Object.hasOwn(Shell.BUILTINS, name),
+            run: (request) => spawned(request),
+          })
+        : {}),
       ...options.commands,
     }),
   )
-  if (!options.python?.remote && !options.python?.module && !(options.webassembly ?? compiles()))
-    for (const name of ['python', 'python3', 'pip', 'pip3'])
+  if (!options.python?.unavailable && !options.python?.module && !(options.webassembly ?? compiles()))
+    for (const name of ['python', 'python3', 'pip', 'pip3', 'uv'])
       if (!options.commands?.[name]) commands.delete(name)
   let calls = 0
+  const shellDefaults: [string, string[]][] = Object.entries({
+    BASH: '/bin/bash',
+    BASH_VERSION: '5.2.21(1)-release',
+    BASH_EXECUTION_STRING: '',
+    OPTERR: '1',
+    PS4: '+ ',
+    IFS: ' \t\n',
+    OPTIND: '1',
+    OSTYPE: 'linux-gnu',
+    ...(machine
+      ? {}
+      : {
+          HOSTNAME: 'localhost',
+          HOSTTYPE: 'x86_64',
+          MACHTYPE: 'x86_64-pc-linux-gnu',
+          BASH_LOADABLES_PATH:
+            '/usr/local/lib/bash:/usr/lib/bash:/opt/local/lib/bash:/usr/pkg/lib/bash:/opt/pkg/lib/bash:.',
+          SHLVL: '1',
+          PPID: '1',
+          UID: '1000',
+          EUID: '1000',
+        }),
+  }).map(([name, value]): [string, string[]] => [name, [value]])
+  if (!machine)
+    shellDefaults.push(['BASH_VERSINFO', ['5', '2', '21', '1', 'release', 'x86_64-pc-linux-gnu']])
+
+  const spawned = async (request: {
+    cwd: string
+    env: Record<string, string>
+    fs: FileSystem.FileSystem
+    script: string
+    signal: AbortSignal
+    stdin: Uint8Array
+  }): Promise<{ status: number; stderr: Uint8Array; stdout: Uint8Array }> => {
+    const engine = await options.psh
+    if (engine) {
+      const ran = await Psh.run(engine, {
+        commandFs: request.fs,
+        commands,
+        cwd: request.cwd,
+        env: request.env,
+        fetch: options.fetch,
+        fs: request.fs,
+        identity: Psh.identity(request.env),
+        kept: undefined,
+        limits: {
+          depth: limits.maxCallDepth,
+          file: limits.maxMemoryBytes,
+          fuel: limits.maxCommands,
+          memory: limits.maxMemoryBytes,
+          operations: limits.maxFileOperations,
+          output: limits.maxOutputLength,
+        },
+        machine,
+        script: request.script,
+        shellLimits: limits,
+        signal: request.signal,
+        stdin: request.stdin,
+        strict: options.fallback === true || machine !== undefined,
+        without: ['curl', 'wget', ...Object.keys(options.commands ?? {})],
+      })
+      return {
+        status: ran.ended === 'exited' ? ran.status : 126,
+        stderr: ran.stderr,
+        stdout: ran.stdout,
+      }
+    }
+    const state = new Shell.State()
+    state.cwd = request.cwd
+    for (const [name, value] of Object.entries({ ...request.env, PWD: request.cwd })) {
+      state.vars.set(name, [value])
+      state.exported.add(name)
+    }
+    const runner = new Shell.Runner(
+      {
+        fs: request.fs,
+        commands,
+        fetch: options.fetch,
+        fallback: options.fallback || machine !== undefined,
+        limits,
+        ...(machine ? { machine } : {}),
+      },
+      state,
+      request.signal,
+    )
+    const stdout = new Shell.Output(limits.maxOutputLength, false)
+    const stderr = new Shell.Output(limits.maxOutputLength, false)
+    let status: number
+    try {
+      status = await Shell.run(runner, request.script, {
+        stdin: new Shell.Input(decode(request.stdin)),
+        stdout,
+        stderr,
+      })
+    } catch (error) {
+      stderr.write('bash: ' + (error instanceof Error ? error.message : String(error)) + '\n')
+      status = 1
+    }
+    return { status, stderr: encode(stderr.text()), stdout: encode(stdout.text()) }
+  }
 
   const emit = (event: Event) => {
     if (!options.observe) return
@@ -197,8 +302,8 @@ export async function create(options: create.Options = {}): Promise<Bash> {
     env,
     async exec(script: string, execOptions: ExecOptions = {}): Promise<Result> {
       const call = ++calls
-      const command = commandOf(script)
-      const started = Date.now()
+      const command = options.observe ? commandOf(script) : 'other'
+      const started = options.observe ? Date.now() : 0
       emit({ phase: 'started', call, command })
       const controller = new AbortController()
       let timedOut = false
@@ -210,8 +315,9 @@ export async function create(options: create.Options = {}): Promise<Bash> {
       const onAbort = () => controller.abort('execution aborted')
       if (execOptions.signal?.aborted) onAbort()
       execOptions.signal?.addEventListener('abort', onAbort, { once: true })
-      const directory = FileSystem.resolvePath(cwd, execOptions.cwd ?? cwd)
-      const engine = await options.psh
+      const directory =
+        execOptions.cwd === undefined ? cwd : FileSystem.resolvePath(cwd, execOptions.cwd)
+      const engine = options.psh === undefined ? undefined : await options.psh
       if (engine) {
         const outcome = await engineRun(engine, {
           controller,
@@ -234,16 +340,17 @@ export async function create(options: create.Options = {}): Promise<Bash> {
           if (timedOut) return 'timeout'
           return outcome.category
         })()
-        emit({
-          phase: 'finished',
-          call,
-          command,
-          status: outcome.exitCode === 0 ? 'success' : 'error',
-          category,
-          exitCode: outcome.exitCode,
-          durationMs: Date.now() - started,
-          outputTruncated: outcome.truncated,
-        })
+        if (options.observe)
+          emit({
+            phase: 'finished',
+            call,
+            command,
+            status: outcome.exitCode === 0 ? 'success' : 'error',
+            category,
+            exitCode: outcome.exitCode,
+            durationMs: Date.now() - started,
+            outputTruncated: outcome.truncated,
+          })
         return {
           stdout: outcome.stdout,
           stderr: outcome.stderr,
@@ -254,37 +361,22 @@ export async function create(options: create.Options = {}): Promise<Bash> {
 
       const state = new Shell.State()
       state.cwd = directory
-      for (const [name, value] of Object.entries({ ...env, ...execOptions.env, PWD: directory })) {
-        state.vars.set(name, [value])
+      const vars = state.vars
+      for (const [name, value] of Object.entries(env)) {
+        vars.set(name, [value])
         state.exported.add(name)
       }
-      for (const [name, value] of Object.entries({
-        BASH: '/bin/bash',
-        BASH_VERSION: '5.2.21(1)-release',
-        BASH_EXECUTION_STRING: script,
-        OPTERR: '1',
-        PS4: '+ ',
-        IFS: ' \t\n',
-        OPTIND: '1',
-        OSTYPE: 'linux-gnu',
-        ...(machine
-          ? {}
-          : {
-              HOSTNAME: 'localhost',
-              HOSTTYPE: 'x86_64',
-              MACHTYPE: 'x86_64-pc-linux-gnu',
-              BASH_LOADABLES_PATH:
-                '/usr/local/lib/bash:/usr/lib/bash:/opt/local/lib/bash:/usr/pkg/lib/bash:/opt/pkg/lib/bash:.',
-              SHLVL: '1',
-              PPID: '1',
-              UID: '1000',
-              EUID: '1000',
-            }),
-      }))
-        if (!state.vars.has(name)) state.vars.set(name, [value])
-      if (!machine && !state.vars.has('BASH_VERSINFO'))
-        state.vars.set('BASH_VERSINFO', ['5', '2', '21', '1', 'release', 'x86_64-pc-linux-gnu'])
-      if (machine) state.vars.known = new Set(state.vars.keys())
+      if (execOptions.env)
+        for (const [name, value] of Object.entries(execOptions.env)) {
+          vars.set(name, [value])
+          state.exported.add(name)
+        }
+      vars.set('PWD', [directory])
+      state.exported.add('PWD')
+      for (const [name, value] of shellDefaults)
+        if (!vars.has(name))
+          vars.set(name, name === 'BASH_EXECUTION_STRING' ? [script] : value.slice())
+      if (machine) vars.known = new Set(vars.keys())
       const budget = { used: 0, refused: false }
       const runner = new Shell.Runner(
         {
@@ -409,16 +501,22 @@ export async function create(options: create.Options = {}): Promise<Bash> {
   }
   const wasm = wasmHost(shell, options.wasm)
   let kept: EngineKept | undefined
+  let spare: { budget: { used: number; refused: boolean }; fs: FileSystem.FileSystem } | undefined
 
   const engineRun = async (
     engine: WebAssembly.Module,
     request: EngineRequest,
   ): Promise<EngineOutcome> => {
-    const budget = { used: 0, refused: false }
+    const lent = spare
+    spare = undefined
+    const budget = lent ? lent.budget : { used: 0, refused: false }
+    budget.used = 0
+    budget.refused = false
+    const commandFs = lent ? lent.fs : budgeted(fs, limits.maxFileOperations, budget)
     const ran = await (async () => {
       try {
         const settings: Psh.run.Options = {
-          commandFs: budgeted(fs, limits.maxFileOperations, budget),
+          commandFs,
           commands,
           cwd: request.directory,
           env: { ...env, ...request.execOptions.env, PWD: request.directory },
@@ -463,6 +561,8 @@ export async function create(options: create.Options = {}): Promise<Bash> {
         return error instanceof Error ? error : new Error(String(error))
       }
     })()
+    const refused = budget.refused
+    spare = { budget, fs: commandFs }
     if (ran instanceof Error)
       return {
         category: 'exception',
@@ -546,7 +646,7 @@ export async function create(options: create.Options = {}): Promise<Bash> {
       case 'cancelled': {
         if (ran.halted !== undefined)
           return outcome('/bin/bash: ' + ran.halted + '\n', 127, 'command_not_found')
-        if (budget.refused)
+        if (refused)
           return outcome(
             '/bin/bash: too many file operations (limit ' +
               limits.maxFileOperations +
@@ -599,7 +699,7 @@ const githubFileInstructions =
   'For single files, read `https://raw.githubusercontent.com/OWNER/REPO/REF/PATH` (REF may be HEAD), and for archives `https://codeload.github.com/OWNER/REPO/tar.gz/REF`, rather than api.github.com: this host may share its address with others, so the API can answer 403 rate limit exceeded.'
 
 const programInstructions =
-  "WebAssembly programs built for WASI (wasm32-wasi) run directly: `./prog.wasm ARGS`, `wasm prog.wasm ARGS` or `wasmtime prog.wasm ARGS`, with stdin, stdout, exit codes, the environment and the files under the working directory (up to 64 MiB, written back when the program exits). There is no C or Rust compiler: write WebAssembly text and assemble it with `wat2wasm prog.wat` (writes prog.wasm; flat or folded instructions, memory, data, globals and imports such as WASI's `fd_write`), rather than writing module bytes by hand, or download the .wasm file. `wasm --invoke NAME FILE ARGS` calls one exported function and prints its result. Python 3 runs on Pyodide (CPython compiled to WebAssembly, loaded on first use): `python3 script.py ARGS`, `python3 -c CODE`, `python3 -m MODULE` and stdin work on the files under the working directory and /tmp, numpy, pandas and the other packages Pyodide ships load when imported, and `pip install PKG` installs pure-Python wheels for the rest of the session. Python has no network access (urllib, requests and sockets fail), so download files with curl first and read them from Python."
+  "WebAssembly programs built for WASI (wasm32-wasi) run directly: `./prog.wasm ARGS`, `wasm prog.wasm ARGS` or `wasmtime prog.wasm ARGS`, with stdin, stdout, exit codes, the environment and the files under the working directory (up to 64 MiB, written back when the program exits). There is no C or Rust compiler: write WebAssembly text and assemble it with `wat2wasm prog.wat` (writes prog.wasm; flat or folded instructions, memory, data, globals and imports such as WASI's `fd_write`), rather than writing module bytes by hand, or download the .wasm file. `wasm --invoke NAME FILE ARGS` calls one exported function and prints its result. Python 3 runs on nanocode's Python (RustPython compiled to WebAssembly with compiled-in C extensions such as numpy, matplotlib, pyyaml, regex, msgpack, ujson, markupsafe and kiwisolver): `python3 script.py ARGS`, `python3 -c CODE`, `python3 -m MODULE` and stdin work on the workspace's files, and `pip install PKG` installs pure-Python (py3-none-any) wheels from PyPI into the workspace's site-packages; packages that need other compiled code don't install. Python has no network access (urllib, requests and sockets fail), so download files with curl first and read them from Python."
 
 export const instructions =
   gitInstructions + ' ' + githubFileInstructions + ' ' + programInstructions

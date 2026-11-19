@@ -13,6 +13,9 @@ These principles come from nanocodexyz/nanocode's `AGENTS.md` and apply to every
 - Validate with focused checks (`npm run check:types`, `npm run build`) and back performance changes with reproducible before/after measurements, keeping cold builds, incremental builds and runtime performance separate.
 - Check behavior with harnesses in ignored `output/` and the measurement scripts in `scripts/` and `bench/`, run against local mocks or the demos, with builds compared by interleaved runs. Keep every artifact in `output/`; never commit them, credentials or personal data.
 - Work on master in the main checkout, commit only your own changes and push each one; no pull requests. There is no CI: build, release and deploy by hand. Use subagents only when asked.
+- Keep reference-build dependencies in the repository. Separate online acquisition from builds. Verify local references with OS network access denied.
+- Keep `SHIPPY_REMOTE_BUILD=0` for local checks. Preserve compiler wrappers. Record external toolchains and system libraries explicitly.
+- Use `cf --profile tempo` for Cloudflare operations, with `CLOUDFLARE_ACCOUNT_ID=0a39052b0a32ba8c8444345fe21b7595`. Use Wrangler only for a documented missing capability.
 - This file holds principles only and rarely changes. DECISIONS.md is the growing log: add what each change establishes and why, with the commands, dates and measurements behind it.
 
 ## Project Principles
@@ -37,7 +40,7 @@ These principles come from nanocodexyz/nanocode's `AGENTS.md` and apply to every
 - Import module-shaped internal files as namespaces (`import * as Store from './Store.ts'`) and access members through the module name. Named imports are fine for types, leaf helpers, command handlers, and third-party APIs that are not module namespaces.
 - Import Node built-ins as namespaces unless the neighboring code or API is clearer with a named import.
 - Re-export public module files as namespaces (`export * as Store from './Store.ts'`). Avoid flattening sibling-module symbols into a barrel.
-- Use static imports. Reserve dynamic imports for a real runtime or bundle boundary, such as a lazily loaded wallet or Pyodide, not dependency-cycle workarounds.
+- Use static imports. Reserve dynamic imports for a real runtime or bundle boundary, such as a lazily loaded wallet, not dependency-cycle workarounds.
 - Use `import type` and `export type` where an import or export is type-only.
 - Use functions and plain data for normal APIs. Classes are limited to errors and framework-required entrypoints such as Durable Objects.
 - Keep error classes in the module that throws them, ordered alphabetically with its public exports. Set custom error `name` values to the namespaced form, such as `Config.InvalidError`.
@@ -226,3 +229,14 @@ Applies to this file, interface copy, and commit messages.
 - `node scripts/wasm.mjs` prints the WebAssembly fingerprint. `node scripts/publish-wasm.mjs` writes or uploads its release asset.
 - `node scripts/release.mjs` publishes the pushed `HEAD` as the release `build-<short commit>`: it builds and uploads the WebAssembly release first when its fingerprint has none, then checks the types and packs the package.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` check Rust.
+
+## Local reference checks
+
+This source-only change includes no private vendor archives or registry source mirror. Reference checks require their separately reviewed local inputs.
+
+```sh
+scripts/reference.sh build-release
+node scripts/reference-publish.mjs --verify ARTIFACT_DIRECTORY RECEIPT_JSON
+```
+
+Reference acquisition and notice review remain required. Do not publish the private vendor tree while its notice coverage is incomplete.

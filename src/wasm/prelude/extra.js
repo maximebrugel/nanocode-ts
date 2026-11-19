@@ -1,4 +1,4 @@
-const { callWasm, fromBase64, fromUtf8, hostFunction, putBytes, setTimeoutWithArgs, toBase64, utf8 } = core;
+const { callWasm, callWasmSync, fromBase64, fromUtf8, hostFunction, putBytes, setTimeoutWithArgs, toBase64, utf8 } = core;
 const log = (...args) => globalThis.console.log(...args);
 const moduleHint = (name) => {
   const bare = String(name).replace(/^node:/, "").split("/")[0];
@@ -121,25 +121,72 @@ class AbortController {
 }
 const toWire = (value) => typeof value === "bigint" ? { bigint: String(value) } : value;
 const fromWire = (value) => Array.isArray(value) ? value.map(fromWire) : value !== null && typeof value === "object" && typeof value.bigint === "string" ? BigInt(value.bigint) : value;
+const wasmSources = "WebAssembly expects a module's bytes (Uint8Array, ArrayBuffer or Buffer), a WebAssembly.Module, WebAssembly text (WAT) or a .wasm file path";
+const described = (value) => value === null || value === undefined ? String(value) : typeof value === "object" ? "an object (" + (value.constructor?.name ?? "Object") + ") with keys " + (Object.keys(value).slice(0, 5).join(", ") || "none") : "a " + typeof value;
 const wasmSource = (source) => {
   if (typeof source === "string") {
-    if (source.length > 4096 || source.includes("\0")) throw new TypeError("expected WebAssembly bytes (Uint8Array or ArrayBuffer) or a file path, got a " + source.length + "-character string: pass the .wasm file's path, or read it as bytes with bash.readFile(path, { encoding: null })");
+    if (/^\s*(\(|;;)/.test(source)) return { bytes: utf8(source) };
+    if (source.startsWith("\0asm")) {
+      if (source.includes("\uFFFD")) throw new TypeError("this string is a binary module decoded as UTF-8 text, which lost bytes: read it with bash.readFile(path, { encoding: null }) or pass the .wasm file's path");
+      return { bytes: utf8(source) };
+    }
+    if (source.length > 4096 || source.includes("\0")) throw new TypeError(wasmSources + ", got a " + source.length + "-character string that is none of these");
     return { path: source };
   }
   if (source instanceof Module) return source.input;
   if (source instanceof ArrayBuffer) return { bytes: new Uint8Array(source) };
   if (ArrayBuffer.isView(source)) return { bytes: new Uint8Array(source.buffer, source.byteOffset, source.byteLength) };
   if (Array.isArray(source)) return { bytes: Uint8Array.from(source) };
-  throw new TypeError("expected WebAssembly bytes (Uint8Array or ArrayBuffer) or a file path");
+  throw new TypeError(wasmSources + ", got " + described(source));
 };
+const isBinary = (bytes) => bytes[0] === 0 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d;
+class CompileError extends Error { name = "CompileError"; }
+class LinkError extends Error { name = "LinkError"; }
+class RuntimeError extends Error { name = "RuntimeError"; }
 const wire = (input) => input.bytes ? { module_ref: putBytes(input.bytes) } : input;
 const importHint = (error, imports) => {
   const names = [];
   for (const [module, entries] of Object.entries(imports ?? {})) for (const [name, value] of Object.entries(entries ?? {})) if (typeof value === "function" || value instanceof Memory) names.push(module + "." + name);
   return names.length ? new Error(error.message + " (the JavaScript imports " + names.join(", ") + " are not linked: cell WebAssembly runs in the host, which provides only WASI preview1 imports)") : error;
 };
+const moduleLayout = { header: 8, sections: { imports: 2, exports: 7 }, kinds: ["function", "table", "memory", "global", "tag"] };
+const moduleEntries = (module, section) => {
+  const bytes = module instanceof Module ? module.input.bytes : undefined;
+  if (!bytes) throw new TypeError("WebAssembly.Module." + section + " expects a WebAssembly.Module built from bytes");
+  let at = moduleLayout.header;
+  const leb = () => { let value = 0, shift = 0, byte; do { byte = bytes[at++]; value += (byte & 0x7f) * 2 ** shift; shift += 7; } while (byte & 0x80); return value; };
+  const name = () => { const length = leb(); const text = new TextDecoder().decode(bytes.subarray(at, at + length)); at += length; return text; };
+  const limits = () => { const flags = bytes[at++]; leb(); if (flags & 1) leb(); };
+  const skip = [() => leb(), () => { at++; limits(); }, limits, () => { at += 2; }, () => { at++; leb(); }];
+  while (at < bytes.length) {
+    const id = bytes[at++];
+    const end = leb() + at;
+    if (id === moduleLayout.sections[section]) {
+      const entries = [];
+      for (let count = leb(); count > 0; count--) {
+        const from = section === "imports" ? name() : undefined;
+        const field = name();
+        const kind = bytes[at++];
+        if (from === undefined) leb(); else skip[kind]?.();
+        entries.push(from === undefined ? { name: field, kind: moduleLayout.kinds[kind] } : { module: from, name: field, kind: moduleLayout.kinds[kind] });
+      }
+      return entries;
+    }
+    at = end;
+  }
+  return [];
+};
 class Module {
-  constructor(source) { const input = wasmSource(source); this.input = input.bytes ? { bytes: input.bytes.slice() } : input; }
+  constructor(source) {
+    const input = wasmSource(source);
+    if (input.bytes && !isBinary(input.bytes) && callWasmSync) {
+      try { this.input = { bytes: fromBase64(callWasmSync({ op: "assemble", module_ref: putBytes(input.bytes) }).module) }; } catch (error) { throw new CompileError(error.message); }
+      return;
+    }
+    this.input = input.bytes ? { bytes: input.bytes.slice() } : input;
+  }
+  static exports(module) { return moduleEntries(module, "exports"); }
+  static imports(module) { return moduleEntries(module, "imports"); }
 }
 class Memory {
   constructor(id) { this.id = id; }
@@ -151,13 +198,23 @@ class Memory {
 const exportsOf = (id, list, imports) => {
   const exports = {};
   for (const entry of list) {
-    if (entry.kind === "function") exports[entry.name] = async (...args) => fromWire((await callWasm({ op: "call", id, name: entry.name, args: args.map(toWire) }).catch((error) => { throw importHint(error, imports); })).result);
+    if (entry.kind === "function") exports[entry.name] = callWasmSync ? (...args) => { try { return fromWire(callWasmSync({ op: "call", id, name: entry.name, args: args.map(toWire) }).result); } catch (error) { throw importHint(error, imports); } } : async (...args) => fromWire((await callWasm({ op: "call", id, name: entry.name, args: args.map(toWire) }).catch((error) => { throw importHint(error, imports); })).result);
     else if (entry.kind === "memory") exports[entry.name] = new Memory(id);
   }
   return Object.freeze(exports);
 };
 class Instance {
   constructor(module, imports) {
+    Object.defineProperties(this, { instance: { value: this }, module: { value: module } });
+    if (callWasmSync) {
+      let reply;
+      try { reply = callWasmSync({ op: "instantiate", ...wire(wasmSource(module)) }); } catch (error) { throw importHint(error, imports); }
+      this.id = reply.id;
+      this.engine = reply.engine;
+      this.exports = exportsOf(reply.id, reply.exports, imports);
+      this.ready = Promise.resolve(this);
+      return;
+    }
     const ready = callWasm({ op: "instantiate", ...wire(wasmSource(module)) });
     this.ready = ready.then((reply) => { this.id = reply.id; this.engine = reply.engine; this.exports = exportsOf(reply.id, reply.exports, imports); return this; }, (error) => { throw importHint(error, imports); });
     this.ready.catch(() => {});
@@ -166,22 +223,27 @@ class Instance {
   async close() { await this.ready; await callWasm({ op: "drop", id: this.id }); }
 }
 const instantiate = async (source, imports) => {
-  const instance = new Instance(source instanceof Module ? source : new Module(source), imports);
+  const module = source instanceof Module ? source : new Module(source);
+  const instance = new Instance(module, imports);
   await instance.ready;
-  return source instanceof Module ? instance : { module: new Module(source), instance };
+  return source instanceof Module ? instance : Object.defineProperty({ module, instance }, "exports", { value: instance.exports });
 };
 const WebAssembly = {
   Module,
   Instance,
   Memory,
+  CompileError,
+  LinkError,
+  RuntimeError,
   compile: async (source) => new Module(source),
   instantiate,
   compileStreaming: async (response) => new Module(new Uint8Array(await (await response).arrayBuffer())),
   instantiateStreaming: async (response, imports) => instantiate(new Uint8Array(await (await response).arrayBuffer()), imports),
-  validate: (source) => { const bytes = wasmSource(source).bytes; return !bytes || (bytes[0] === 0 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d); },
+  validate: (source) => { try { const bytes = new Module(source).input.bytes; return !bytes || isBinary(bytes); } catch { return false; } },
 };
 const wasm = {
   run: async (source, args = [], options = {}) => {
+    if (!Array.isArray(args)) throw new TypeError("wasm.run(module, args, options) runs a WASI command with an array of string arguments, got " + described(args) + ": to call one export use wasm.invoke(module, name, ...args)");
     const reply = await callWasm({ op: "run", ...wire(wasmSource(source)), args: args.map(String), ...(options.stdin === undefined ? {} : { stdin: String(options.stdin) }), ...(options.env ? { env: options.env } : {}) });
     return { stdout: reply.stdout, stderr: reply.stderr, exitCode: reply.exit_code };
   },

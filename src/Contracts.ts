@@ -93,6 +93,7 @@ export type CodexOptions = {
   max_output_tokens?: number
   min_wait_ms?: number
   verification_requested?: boolean
+  single_verification?: boolean
 }
 
 export type AgentConfiguration = {
@@ -132,6 +133,7 @@ export type AgentConfiguration = {
   tool_repair?: boolean
   low_effort_rounds?: boolean
   persist_finish?: boolean
+  omit_media_on_empty_cut?: boolean
   persistence_nudge?: boolean
   result_effort?: Effort
   service_tier?: ServiceTier
@@ -141,6 +143,7 @@ export type AgentConfiguration = {
   tool_result_clearing?: ToolResultClearing
   tool_result_tokens?: number
   yield_floor_ms?: number
+  stall_nudge_ms?: number
   yield_share?: number
   remote_children?: boolean
   child_lineage?: unknown
@@ -407,6 +410,19 @@ export type SocketHandshake = {
   text(): Promise<string>
 }
 
+export type SpareSocket = {
+  request: {
+    provider: ModelProvider
+    headers: [string, string][]
+    origin: string | null
+    subagent: Subagent | null
+  }
+  socket: MessageSocket
+  status: number
+  headers: [string, string][]
+  idle_ms?: number
+}
+
 export type RemoteRequest = {
   op: string
   connection?: string | null
@@ -517,6 +533,7 @@ export type ChildHost = {
 }
 
 export type RuntimeOptions = {
+  instructions?: string
   children?: ChildHost
   childSubagent?(session_id: string): Promise<Subagent | null>
   childTool?(name: string, input: unknown, context: unknown, signal: AbortSignal): Promise<unknown>
@@ -546,6 +563,7 @@ export type RuntimeOptions = {
       timing: RuntimeTiming,
     ): Promise<SocketHandshake>
     admit(origin: string | null, subagent: Subagent | null): Promise<void>
+    release?(spare: SpareSocket): void
   }
   tools?: {
     call(

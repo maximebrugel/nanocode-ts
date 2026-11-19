@@ -46,7 +46,7 @@ if (!binaryen) {
     if (unpacked.status !== 0) process.exit(unpacked.status ?? 1);
   }
 }
-const wasmFeatures = ["--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-multivalue", "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-reference-types", "--enable-sign-ext", "--enable-simd"];
+const wasmFeatures = ["--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-exception-handling", "--enable-multivalue", "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-reference-types", "--enable-sign-ext", "--enable-simd"];
 const oneCallerInlineMaxSize = 100;
 function optimize(input, output, flags = ["-O1"]) {
   const result = spawnSync(join(binaryen, "bin", "wasm-opt"), [...flags, ...wasmFeatures, input, "-o", output], { stdio: "inherit" });
@@ -119,10 +119,13 @@ try { previousPsh = readFileSync("dist/psh.wasm"); } catch (error) { if (error.c
 if (!previousPsh?.equals(pshBytes)) writeFileSync("dist/psh.wasm", pshBytes);
 
 optimize(buildPython(), "target/python/python.opt.wasm", ["-Oz"]);
-const pythonBytes = bakePython(readFileSync("target/python/python.opt.wasm"));
+const { module: pythonBytes, image: pythonImage } = bakePython(readFileSync("target/python/python.opt.wasm"), { image: true });
 let previousPython;
 try { previousPython = readFileSync("dist/python.wasm"); } catch (error) { if (error.code !== "ENOENT") throw error; }
 if (!previousPython?.equals(pythonBytes)) writeFileSync("dist/python.wasm", pythonBytes);
+let previousImage;
+try { previousImage = readFileSync("dist/python.data"); } catch (error) { if (error.code !== "ENOENT") throw error; }
+if (!previousImage?.equals(pythonImage)) writeFileSync("dist/python.data", pythonImage);
 
 const { AgentRuntime } = await import("../src/index.ts");
 const runtime = await AgentRuntime.instantiate(await WebAssembly.compile(bytes), { transaction() { throw new Error("the model catalog runs no SQL"); } }, { published() {} });

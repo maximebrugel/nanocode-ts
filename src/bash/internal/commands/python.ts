@@ -1,32 +1,12 @@
-import { CommandError, Input, type CommandContext, type CommandHandler } from '../Shell.ts'
-import { FsError, type FileStat, type FileSystem, type SyncFileSystem } from '../../FileSystem.ts'
+import { CommandError, type CommandContext, type CommandHandler } from '../Shell.ts'
+import { FsError, type FileSystem } from '../../FileSystem.ts'
 import { breathe, decode, encode, parentOf } from '../Fs.ts'
 import * as Psh from '../Psh.ts'
 import { mkdirs } from './files.ts'
-import * as Lazy from './pylazy.ts'
+import * as Journal from './journal.ts'
+import { pip, shippedModules, sitePackages } from './pip.ts'
 import * as RustPython from './rustpython.ts'
-import type {
-  Options as PythonOptions,
-  Pyodide,
-  PyodideFS,
-  Reply as PythonReply,
-  Remote as PythonRemote,
-  Request as PythonRequest,
-} from '../../Python.ts'
-import {
-  type PythonChanges,
-  pythonWorkers,
-  workerExclusive,
-  workerPreload,
-  workerRun,
-  workerStamps,
-  workerSync,
-  workerVersion,
-} from './pyworker.ts'
-
-export const pyodideVersion = '314.0.7'
-
-export const pyodideUrl = 'https://cdn.jsdelivr.net/pyodide/v' + pyodideVersion + '/full/'
+import type { Options as PythonOptions, Sci } from '../../Python.ts'
 
 type Mode = {
   kind: 'code' | 'stdin' | 'file' | 'module' | 'pip'
@@ -35,546 +15,60 @@ type Mode = {
   filename: string
 }
 
-type Tree = { files: Map<string, Uint8Array>; dirs: Set<string> }
-
-type Snapshot = Tree & {
-  partial: Set<string>
-  bytes: number
-  entries: number
-  left: number
-  leftBytes: number
+export type Host = {
+  has(name: string): boolean
+  run(request: {
+    cwd: string
+    env: Record<string, string>
+    fs: FileSystem
+    script: string
+    signal: AbortSignal
+    stdin: Uint8Array
+  }): Promise<{ status: number; stderr: Uint8Array; stdout: Uint8Array }>
 }
 
-type Listing = {
-  files: Map<string, string>
-  dirs: Set<string>
-  partial: Set<string>
-  bytes: number
-  left: number
-  leftBytes: number
-}
+const NO_IMAGE =
+  "python3 needs nanocode-ts's python.data beside python.wasm: pass it as Python's data option"
 
-type Mirror = { id: string; known: Map<string, string>; adopted: Map<string, string> }
-
-const THREADED_BYTES = 256 * 1024 * 1024
-
-type Instance = {
-  pyodide: Pyodide
-  start: (request: string) => PromiseLike<unknown>
-  cancel: () => unknown
-  mirrored: Set<string>
-  queue: Promise<unknown>
-  micropip: boolean
-}
-
-const RESERVED = ['/dev', '/proc', '/lib', '/home/pyodide', '/home/web_user']
-
-const NO_WASM = "python3 needs a host that can compile WebAssembly; this one can't"
-
-export const HELPER = String.raw`
-import asyncio, json, os, signal, sys, traceback, types
-from pyodide.code import eval_code_async
-import warnings
-warnings.filterwarnings("ignore", message="The [xy] parameter as float was deprecated")
-sys.dont_write_bytecode = True
-_base = set(sys.modules)
-_active = False
-
-class Interrupted(Exception):
-    pass
-
-
-def _status(error):
-    code = error.code
-    if code is None:
-        return 0
-    if isinstance(code, bool) or not isinstance(code, int):
-        print(code, file=sys.stderr)
-        return 1
-    return code & 255
-
-def _internal(code):
-    name = code.co_filename
-    return name in ("<exec>", "<nanocode>") or name.startswith("/lib/python") and ("/_pyodide/" in name or "/pyodide/" in name or name.endswith("/runpy.py"))
-
-def _interrupt(signum, frame):
-    while _active and frame is not None:
-        if "/asyncio/" in frame.f_code.co_filename or frame.f_code.co_filename.endswith("/webloop.py"):
-            return
-        if not _internal(frame.f_code):
-            raise Interrupted()
-        frame = frame.f_back
-
-signal.signal(signal.SIGINT, _interrupt)
-
-_NETWORK = ("socket", "ssl", "http.client", "urllib.error", "urllib3", "requests", "httpx", "aiohttp")
-
-def _offline(error):
-    seen = set()
-    while error is not None and id(error) not in seen:
-        seen.add(id(error))
-        kind = type(error)
-        if isinstance(error, (ConnectionError, TimeoutError)) or kind.__module__.split(".")[0] in _NETWORK or kind.__module__ in _NETWORK or "TLS not supported" in str(error):
-            return True
-        tb = error.__traceback__
-        while isinstance(error, OSError) and tb is not None:
-            if tb.tb_frame.f_code.co_filename.endswith(("/socket.py", "/ssl.py", "/http/client.py", "/urllib/request.py")):
-                return True
-            tb = tb.tb_next
-        error = error.__cause__ or error.__context__
-    return False
-
-def _report(error):
-    tb = error.__traceback__
-    while tb is not None and _internal(tb.tb_frame.f_code):
-        tb = tb.tb_next
-    traceback.print_exception(type(error), error, tb)
-    if _offline(error):
-        print("python3: Python here runs on Pyodide (WebAssembly) and cannot open network connections. Download the file with curl in bash first (curl -sL -o data.json URL), then read it from Python.", file=sys.stderr)
-
-def _streams():
-    sys.stdin = open("/dev/stdin", "r", encoding="utf-8", errors="surrogateescape")
-    sys.stdout = open("/dev/stdout", "w", encoding="utf-8", errors="backslashreplace", buffering=1)
-    sys.stderr = open("/dev/stderr", "w", encoding="utf-8", errors="backslashreplace", buffering=1)
-
-async def _pip(args):
-    import micropip
-    if not args or args[0] in ("-h", "--help", "help"):
-        print("usage: pip install [-r FILE] [--no-deps] [--pre] [-i URL] PKG... | uninstall PKG... | list | freeze | show PKG")
-        return 0
-    if args[0] in ("-V", "--version"):
-        print("pip (micropip " + getattr(micropip, "__version__", "") + " on Pyodide)")
-        return 0
-    command, rest = args[0], args[1:]
-    if command == "install":
-        reqs, deps, pre, index, quiet, i = [], True, False, None, False, 0
-        while i < len(rest):
-            arg = rest[i]
-            if arg in ("-r", "--requirement") or arg.startswith("--requirement="):
-                if "=" in arg:
-                    path = arg.split("=", 1)[1]
-                else:
-                    i += 1
-                    path = rest[i]
-                for line in open(path).read().splitlines():
-                    line = line.split("#", 1)[0].strip()
-                    if line and not line.startswith("-"):
-                        reqs.append(line)
-            elif arg in ("-i", "--index-url"):
-                i += 1
-                index = rest[i]
-            elif arg.startswith("--index-url="):
-                index = arg.split("=", 1)[1]
-            elif arg == "--no-deps":
-                deps = False
-            elif arg == "--pre":
-                pre = True
-            elif arg in ("-q", "--quiet", "-qq", "-qqq"):
-                quiet = True
-            elif not arg.startswith("-"):
-                reqs.append("emfs:" + os.path.abspath(arg) if arg.endswith(".whl") and os.path.exists(arg) else arg)
-            i += 1
-        if not reqs:
-            print("ERROR: You must give at least one requirement to install", file=sys.stderr)
-            return 1
-        before = {name: package.version for name, package in micropip.list().items()}
-        try:
-            await micropip.install(reqs, deps=deps, pre=pre, index_urls=index)
-        except Exception as error:
-            print("ERROR: " + str(error), file=sys.stderr)
-            return 1
-        added = sorted(name + "-" + package.version for name, package in micropip.list().items() if before.get(name) != package.version)
-        if not quiet:
-            print("Successfully installed " + " ".join(added) if added else "Requirement already satisfied: " + " ".join(reqs))
-        return 0
-    if command == "uninstall":
-        installed = micropip.list()
-        for name in [arg for arg in rest if not arg.startswith("-")]:
-            if name not in installed:
-                print("WARNING: Skipping " + name + " as it is not installed.", file=sys.stderr)
-                continue
-            micropip.uninstall(name)
-            print("Successfully uninstalled " + name + "-" + installed[name].version)
-        return 0
-    if command in ("list", "freeze"):
-        packages = sorted(micropip.list().items(), key=lambda item: item[0].lower())
-        if command == "freeze":
-            for name, package in packages:
-                print(name + "==" + package.version)
-            return 0
-        width = max([len("Package")] + [len(name) for name, _ in packages])
-        print("Package".ljust(width) + " Version")
-        print("-" * width + " -------")
-        for name, package in packages:
-            print(name.ljust(width) + " " + package.version)
-        return 0
-    if command == "show":
-        from importlib import metadata
-        status = 0
-        for name in [arg for arg in rest if not arg.startswith("-")]:
-            try:
-                meta = metadata.metadata(name)
-            except metadata.PackageNotFoundError:
-                print("WARNING: Package(s) not found: " + name, file=sys.stderr)
-                status = 1
-                continue
-            for key in ("Name", "Version", "Summary", "Home-page", "Author", "License"):
-                print(key + ": " + (meta.get(key) or ""))
-            print("Requires: " + ", ".join(metadata.requires(name) or []))
-        return status
-    print("ERROR: unknown command " + repr(command) + " (supported: install, uninstall, list, freeze, show)", file=sys.stderr)
-    return 1
-
-_task = None
-
-def start(request):
-    global _task
-    _task = asyncio.ensure_future(run(request))
-    return _task
-
-def cancel():
-    if _task is not None and not _task.done():
-        _task.cancel()
-
-async def run(request):
-    global _active
-    request = json.loads(request)
-    kind, target, filename = request["kind"], request["target"], request["filename"]
-    os.chdir(request["cwd"])
-    os.environ.clear()
-    os.environ.update(request["env"])
-    sys.argv = request["argv"]
-    sys.path[0] = request["path0"]
-    _streams()
-    previous = sys.modules.get("__main__")
-    main = types.ModuleType("__main__")
-    main.__dict__["__builtins__"] = __builtins__
-    if kind == "file":
-        main.__file__ = filename
-    status = 0
-    try:
-        _active = True
-        if kind == "pip":
-            status = await _pip(request["argv"])
-        elif kind == "module":
-            import runpy
-            runpy.run_module(target, run_name="__main__", alter_sys=True)
-        else:
-            sys.modules["__main__"] = main
-            await eval_code_async(target, main.__dict__, return_mode="none", filename=filename, dedent=False)
-    except (Interrupted, asyncio.CancelledError):
-        status = -1
-    except SystemExit as error:
-        status = _status(error)
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt", file=sys.stderr)
-        status = 130
-    except BaseException as error:
-        _report(error)
-        status = 1
-    finally:
-        _active = False
-        for stream in (sys.stdout, sys.stderr, sys.stdin):
-            try:
-                stream.close()
-            except Exception:
-                pass
-        if previous is not None:
-            sys.modules["__main__"] = previous
-        for name, module in list(sys.modules.items()):
-            path = getattr(module, "__file__", None)
-            if name not in _base and name != "__main__" and isinstance(path, str) and not path.startswith("/lib/"):
-                del sys.modules[name]
-    return status
-`
-
-let compiles: boolean | undefined
-
-const instances = new WeakMap<object, Promise<Instance>>()
-
-const defaultKey = {}
-
-function canCompile(): boolean {
-  if (compiles !== undefined) return compiles
-  try {
-    new (WebAssembly as unknown as { Module: new (bytes: Uint8Array) => unknown }).Module(
-      new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]),
-    )
-    compiles = true
-  } catch {
-    compiles = false
-  }
-  return compiles
-}
-
-function inNode(): boolean {
-  return (
-    typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions
-      ?.node === 'string'
-  )
-}
-
-function requireFromCwd(
-  specifier: string,
-): { loadPyodide?: (config: Record<string, unknown>) => Promise<Pyodide> } | undefined {
-  const process = (
-    globalThis as { process?: { cwd?: () => string; getBuiltinModule?: (id: string) => unknown } }
-  ).process
-  const builtin = process?.getBuiltinModule?.('node:module') as
-    | { createRequire?: (path: string) => (id: string) => unknown }
-    | undefined
-  if (!builtin?.createRequire || !process?.cwd) return undefined
-  try {
-    return builtin.createRequire(process.cwd() + '/package.json')(specifier) as {
-      loadPyodide?: (config: Record<string, unknown>) => Promise<Pyodide>
-    }
-  } catch {
-    return undefined
-  }
-}
-
-function packageCacheDir(): string {
-  const process = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } })
-    .process
-  const os = process?.getBuiltinModule?.('node:os') as { tmpdir?: () => string } | undefined
-  return (os?.tmpdir?.() ?? '/tmp') + '/nanocode-pyodide-' + pyodideVersion
-}
-
-async function loadDefault(options: PythonOptions): Promise<Pyodide> {
-  const index = options.indexURL ?? pyodideUrl
-  const candidates = inNode() && !options.indexURL ? ['pyodide'] : [index + 'pyodide.mjs']
-  const errors: string[] = []
-  for (const specifier of candidates) {
-    let module: { loadPyodide?: (config: Record<string, unknown>) => Promise<Pyodide> }
-    try {
-      module = await import(specifier).catch((error: unknown) => {
-        if (specifier === 'pyodide') throw error
-        return (
-          new Function('specifier', 'return import(specifier)') as (
-            specifier: string,
-          ) => Promise<typeof module>
-        )(specifier)
-      })
-    } catch (error) {
-      const required = specifier === 'pyodide' ? requireFromCwd(specifier) : undefined
-      if (!required) {
-        errors.push(specifier + ': ' + (error instanceof Error ? error.message : String(error)))
-        continue
-      }
-      module = required
-    }
-    if (typeof module.loadPyodide !== 'function') {
-      errors.push(specifier + ' has no loadPyodide export')
-      continue
-    }
-    return module.loadPyodide(
-      specifier === 'pyodide'
-        ? { packageCacheDir: packageCacheDir(), stdout: () => {}, stderr: () => {} }
-        : { indexURL: index, stdout: () => {}, stderr: () => {} },
-    )
-  }
-  throw new CommandError(
-    'cannot load Pyodide' +
-      (inNode() ? ' (install the pyodide npm package or set BashOptions.python.load)' : '') +
-      ': ' +
-      errors.join('; '),
-    127,
-  )
-}
-
-function instance(options: PythonOptions): Promise<Instance> {
-  const key = options.load ?? (options.indexURL ? options : defaultKey)
-  const cached = instances.get(key)
-  if (cached) return cached
-  const created = (async () => {
-    const pyodide = await (options.load ? options.load() : loadDefault(options))
-    const namespace = (pyodide.globals.get('dict') as () => { get(name: string): unknown })()
-    pyodide.runPython(HELPER, { globals: namespace })
-    const start = namespace.get('start') as (request: string) => PromiseLike<unknown>
-    const cancel = namespace.get('cancel') as () => unknown
-    return {
-      pyodide,
-      start,
-      cancel,
-      mirrored: new Set<string>(),
-      queue: Promise.resolve(),
-      micropip: false,
-    }
-  })()
-  instances.set(key, created)
-  created.catch(() => instances.delete(key))
-  return created
-}
-
-const preloaded = new WeakMap<Instance, Set<string>>()
-
-function threaded(options: PythonOptions): boolean {
-  return options.worker !== false && !options.load && !options.indexURL && pythonWorkers()
-}
-
-const warmed = new Set<string>()
-
-export async function preload(options: preload.Options = {}): Promise<void> {
-  const packages = options.packages ?? []
-  const compiled = await rustModule(options)
-  if (compiled) warmRust(compiled)
-  if (compiled && !packages.length) return
-  if (!canCompile()) return
-  if (threaded(options)) {
-    const fresh = packages.filter((name) => !warmed.has(name))
-    for (const name of fresh) warmed.add(name)
-    return workerPreload(HELPER, packageCacheDir(), fresh).catch(() => {})
-  }
-  return instance(options)
-    .then(async (python) => {
-      const loaded = preloaded.get(python) ?? new Set<string>()
-      preloaded.set(python, loaded)
-      const fresh = packages.filter((name) => !loaded.has(name))
-      for (const name of fresh) loaded.add(name)
-      if (fresh.length)
-        await python.pyodide.loadPackage(fresh, {
-          messageCallback: () => {},
-          errorCallback: () => {},
-        })
-    })
-    .catch(() => {})
-}
-
-export declare namespace preload {
-  type Options = PythonOptions & {
-    packages?: readonly string[] | undefined
-  }
-}
-
-function reserved(path: string): boolean {
-  return RESERVED.some((prefix) => path === prefix || path.startsWith(prefix + '/'))
-}
+const NO_MODULE =
+  "python3 needs nanocode-ts's python.wasm: this host can't load it, so pass it as Python's module option"
 
 function join(base: string, name: string): string {
   return base === '/' ? '/' + name : base + '/' + name
-}
-
-function within(path: string, dir: string): boolean {
-  return path === dir || path.startsWith(dir === '/' ? '/' : dir + '/')
-}
-
-async function snapshot(
-  fs: FileSystem,
-  roots: string[],
-  maxBytes: number,
-  maxFiles: number,
-): Promise<Snapshot> {
-  const result: Snapshot = {
-    files: new Map(),
-    dirs: new Set(),
-    partial: new Set(),
-    bytes: 0,
-    entries: 0,
-    left: 0,
-    leftBytes: 0,
-  }
-  const queue = [...roots]
-  for (let index = 0; index < queue.length; index++) {
-    const path = queue[index]
-    if (reserved(path) || result.files.has(path) || result.dirs.has(path)) continue
-    await breathe()
-    const stat = await fs.stat(path)
-    if (!stat) continue
-    if (
-      result.entries >= maxFiles ||
-      (stat.kind === 'file' && result.bytes + stat.size > maxBytes)
-    ) {
-      result.partial.add(stat.kind === 'file' ? parentOf(path) : path)
-      if (stat.kind === 'file') {
-        result.left++
-        result.leftBytes += stat.size
-      }
-      continue
-    }
-    result.entries++
-    if (stat.kind === 'file') {
-      const data = await fs.read(path)
-      result.bytes += data.length
-      result.files.set(path, data)
-      continue
-    }
-    result.dirs.add(path)
-    for (const name of await fs.list(path)) queue.push(join(path, name))
-  }
-  return result
-}
-
-function unmirror(fs: PyodideFS, path: string): void {
-  if (reserved(path) || !fs.analyzePath(path).exists) return
-  if (!fs.isDir(fs.stat(path).mode)) {
-    fs.unlink(path)
-    return
-  }
-  for (const name of fs.readdir(path))
-    if (name !== '.' && name !== '..') unmirror(fs, join(path, name))
-  if (path !== '/' && !RESERVED.some((prefix) => within(prefix, path))) fs.rmdir(path)
-}
-
-function mirror(fs: PyodideFS, snap: Snapshot): void {
-  for (const dir of snap.dirs) fs.mkdirTree(dir)
-  for (const [path, data] of snap.files) {
-    fs.mkdirTree(parentOf(path))
-    fs.writeFile(path, data)
-  }
-}
-
-function collect(fs: PyodideFS, roots: string[]): Tree {
-  const tree: Tree = { files: new Map(), dirs: new Set() }
-  const visit = (path: string) => {
-    if (
-      reserved(path) ||
-      tree.files.has(path) ||
-      tree.dirs.has(path) ||
-      !fs.analyzePath(path).exists
-    )
-      return
-    const mode = fs.stat(path).mode
-    if (fs.isFile(mode)) tree.files.set(path, fs.readFile(path))
-    if (!fs.isDir(mode)) return
-    tree.dirs.add(path)
-    for (const name of fs.readdir(path)) if (name !== '.' && name !== '..') visit(join(path, name))
-  }
-  for (const root of roots) visit(root)
-  return tree
-}
-
-function same(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
-  return true
-}
-
-async function writeBack(fs: FileSystem, snap: Snapshot, after: Tree): Promise<void> {
-  const partial = (path: string) => [...snap.partial].some((dir) => within(dir, path))
-  const removals = [...snap.files.keys(), ...snap.dirs]
-    .filter((path) => !after.files.has(path) && !after.dirs.has(path))
-    .sort((a, b) => b.length - a.length)
-  for (const path of removals) {
-    if (snap.dirs.has(path) && partial(path)) continue
-    await fs.remove(path).catch((error) => {
-      if (!(error instanceof FsError)) throw error
-    })
-  }
-  for (const dir of [...after.dirs].sort()) if (!snap.dirs.has(dir)) await mkdirs(fs, dir)
-  for (const [path, data] of after.files) {
-    const before = snap.files.get(path)
-    if (before && same(before, data)) continue
-    await breathe()
-    await mkdirs(fs, parentOf(path))
-    await fs.write(path, data)
-  }
 }
 
 function usage(name: string): string {
   return 'usage: ' + name + ' [-c CMD | -m MOD | FILE | -] [ARGS...]'
 }
 
+function uv(args: string[]): Mode | 'version' {
+  const rest = args.filter((arg) => arg !== '--system' && arg !== '--quiet' && arg !== '-q')
+  const quiet = args.includes('-q') || args.includes('--quiet') ? ['-q'] : []
+  const [command, ...more] = rest
+  if (command === '--version' || command === 'version') return 'version'
+  if (command === 'pip') return { kind: 'pip', target: '', argv: [...more, ...quiet], filename: '' }
+  if (command === 'add')
+    return { kind: 'pip', target: '', argv: ['install', ...more, ...quiet], filename: '' }
+  if (command === 'remove')
+    return { kind: 'pip', target: '', argv: ['uninstall', '-y', ...more], filename: '' }
+  throw new CommandError(
+    'only uv pip, uv add, uv remove and uv run (python or a .py file) work here; they use pip and python3',
+    2,
+  )
+}
+
+function uvRun(ctx: CommandContext): CommandContext {
+  const args = ctx.args.filter((arg) => arg !== '--system')
+  if (args[0] !== 'run') return ctx
+  const rest = args[1] === '--' ? args.slice(2) : args.slice(1)
+  if (rest[0] === 'python' || rest[0] === 'python3')
+    return { ...ctx, name: 'python3', args: rest.slice(1) }
+  if (rest[0]?.endsWith('.py')) return { ...ctx, name: 'python3', args: rest }
+  return ctx
+}
+
 function parse(ctx: CommandContext, args: string[]): Mode | 'help' | 'version' {
+  if (ctx.name === 'uv') return uv(args)
   if (ctx.name === 'pip' || ctx.name === 'pip3')
     return { kind: 'pip', target: '', argv: args, filename: '' }
   let i = 0
@@ -631,460 +125,59 @@ function parse(ctx: CommandContext, args: string[]): Mode | 'help' | 'version' {
 export function pythonCommands(
   options: PythonOptions = {},
   psh?: WebAssembly.Module | Promise<WebAssembly.Module>,
+  host?: Host,
 ): Record<string, CommandHandler> {
   const maxBytes = options.maxBytes ?? 64 * 1024 * 1024
-  const maxFiles = options.maxFiles ?? 20_000
-  const mirror: Mirror = { id: '', known: new Map(), adopted: new Map() }
-  let local = options.mirror ?? ''
-  const handler: CommandHandler = async (context) => {
-    let ctx = context
+  const handler: CommandHandler = async (given) => {
+    if (options.unavailable) throw new CommandError(options.unavailable, 126)
+    const ctx = given.name === 'uv' ? uvRun(given) : given
     const mode = parse(ctx, ctx.args.slice())
     if (mode === 'help') {
       ctx.stdout.write(
         usage(ctx.name) +
-          '\nPython on RustPython, with Pyodide ' +
-          pyodideVersion +
-          ' (CPython for WebAssembly) for packages and pip install through micropip\n',
+          '\nPython on nanocode-python (RustPython with compiled-in extensions); pip installs pure-Python wheels into ' +
+          sitePackages +
+          '\n',
       )
       return 0
     }
-    const compiled =
-      mode !== 'version' && mode.kind === 'pip' ? undefined : await rustModule(options)
-    if (compiled) {
-      const stdin = ctx.stdin.read()
-      const status = await executeRust(ctx, compiled, {
-        engine: psh === undefined ? undefined : await Psh.load(await psh),
-        fallback: options.remote !== undefined || canCompile(),
-        maxBytes,
-        stdin,
-        cpuMs: options.cpuMs,
-        stepsPerMs: options.stepsPerMs,
-      })
-      if (status !== undefined) return status
-      ctx = { ...ctx, stdin: new Input(stdin) }
-    }
-    if (options.remote) {
-      if (!options.shared) mirror.id ||= options.mirror ?? crypto.randomUUID()
-      return executeRemote(
-        ctx,
-        options.remote,
-        mode,
-        maxBytes,
-        maxFiles,
-        mirror,
-        options.batchBytes ?? 6 * 1024 * 1024,
-        options.shared ?? false,
+    if (mode === 'version' && ctx.name === 'uv') {
+      ctx.stdout.write(
+        'uv (nanocode compatibility: uv pip and uv add run pip, uv run runs python3)\n',
       )
+      return 0
     }
-    if (!canCompile()) {
-      ctx.stderr.write(NO_WASM + '\n')
+    if (mode !== 'version' && mode.kind === 'pip') return pip(ctx, mode.argv)
+    const stdin = ctx.stdin.read()
+    const sci = options.sci
+    const modules = sci?.modules ?? sciModules
+    const run = {
+      engine: psh === undefined ? undefined : await Psh.load(await psh),
+      host,
+      maxBytes,
+      stdin,
+      cpuMs: options.cpuMs,
+      stepsPerMs: options.stepsPerMs,
+    }
+    if (
+      sci &&
+      (sci.mode === 'all' || (mode !== 'version' && (await importsAny(ctx, mode, stdin, modules))))
+    )
+      return runSci(ctx, sci, run)
+    const compiled = await rustModule(options)
+    if (!compiled) {
+      ctx.stderr.write(NO_MODULE + '\n')
       return 126
     }
-    if (mode !== 'version' && mode.kind === 'file') {
-      const stat = await ctx.fs.stat(mode.filename)
-      if (!stat || stat.kind !== 'file') {
-        ctx.stderr.write(
-          ctx.name +
-            ": can't open file '" +
-            mode.filename +
-            "': [Errno " +
-            (stat ? '21] Is a directory' : '2] No such file or directory') +
-            '\n',
-        )
-        return 2
-      }
+    const missing = await rustImage(options, compiled)
+    if (missing) {
+      ctx.stderr.write(missing + '\n')
+      return 126
     }
-    const stdin = ctx.stdin.read()
-    if (threaded(options)) {
-      local ||= crypto.randomUUID()
-      return executeThreaded(ctx, mode, stdin, options.maxBytes ?? THREADED_BYTES, maxFiles, local)
-    }
-    const python = await instance(options)
-    const task = python.queue.then(() => execute(ctx, python, mode, stdin, maxBytes, maxFiles))
-    python.queue = task.catch(() => {})
-    return task
+    const status = await executeRust(ctx, compiled, { ...run, sci: sci && modules })
+    return status === 'sci' ? runSci(ctx, sci!, run) : status
   }
-  return { pip: handler, pip3: handler, python: handler, python3: handler }
-}
-
-function unbase64(text: string): Uint8Array {
-  const raw = atob(text)
-  const bytes = new Uint8Array(raw.length)
-  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i)
-  return bytes
-}
-
-async function scan(
-  fs: FileSystem,
-  roots: string[],
-  maxBytes: number,
-  maxFiles: number,
-  maxFileBytes: number,
-): Promise<Listing> {
-  const result: Listing = {
-    files: new Map(),
-    dirs: new Set(),
-    partial: new Set(),
-    bytes: 0,
-    left: 0,
-    leftBytes: 0,
-  }
-  const queue = [...roots]
-  let entries = 0
-  for (let index = 0; index < queue.length; index++) {
-    const path = queue[index]
-    if (reserved(path) || result.files.has(path) || result.dirs.has(path)) continue
-    if (index % 256 === 0) await breathe()
-    const stat = await fs.stat(path)
-    if (!stat) continue
-    if (
-      stat.kind === 'file' &&
-      (entries >= maxFiles || result.bytes + stat.size > maxBytes || stat.size > maxFileBytes)
-    ) {
-      result.partial.add(parentOf(path))
-      result.left++
-      result.leftBytes += stat.size
-      continue
-    }
-    if (stat.kind !== 'file' && entries >= maxFiles) {
-      result.partial.add(path)
-      continue
-    }
-    entries++
-    if (stat.kind === 'file') {
-      result.bytes += stat.size
-      result.files.set(path, stat.size + ':' + stat.mtime)
-      continue
-    }
-    result.dirs.add(path)
-    for (const name of await fs.list(path)) queue.push(join(path, name))
-  }
-  return result
-}
-
-function leftOut(
-  ctx: CommandContext,
-  left: number,
-  bytes: number,
-  partial: Set<string>,
-  limit: string,
-): void {
-  if (!left && !partial.size) return
-  const where = [...partial].sort().slice(0, 3).join(', ')
-  ctx.stderr.write(
-    ctx.name +
-      ': warning: Python cannot see ' +
-      (left
-        ? left +
-          ' file' +
-          (left === 1 ? '' : 's') +
-          ' (' +
-          (bytes / 1024 / 1024).toFixed(1) +
-          ' MiB) '
-        : 'some files ') +
-      'under ' +
-      where +
-      (partial.size > 3 ? ' and ' + (partial.size - 3) + ' more directories' : '') +
-      ', past ' +
-      limit +
-      '; cd into the directory the script needs, or move large files out of it\n',
-  )
-}
-
-async function executeRemote(
-  ctx: CommandContext,
-  remote: PythonRemote,
-  mode: Mode | 'version',
-  maxBytes: number,
-  maxFiles: number,
-  mirror: Mirror,
-  batchBytes: number,
-  shared: boolean,
-): Promise<number> {
-  const stdin = ctx.stdin.read()
-  const kind = mode === 'version' ? 'version' : mode.kind
-  const roots =
-    mode === 'version'
-      ? []
-      : [ctx.cwd, '/tmp', ...(mode.kind === 'file' ? [mode.filename] : [])].filter(
-          (root) => !reserved(root),
-        )
-  const unique = roots.filter(
-    (root, index) =>
-      roots.indexOf(root) === index &&
-      !roots.some((other) => other !== root && within(root, other)),
-  )
-  const target =
-    mode === 'version'
-      ? ''
-      : mode.kind === 'file'
-        ? ''
-        : mode.kind === 'stdin'
-          ? stdin
-          : mode.target
-  const call = async (request: PythonRequest): Promise<PythonReply> => {
-    try {
-      return await remote(request, ctx.signal)
-    } catch (error) {
-      if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-      throw new CommandError(
-        ctx.name + ': ' + (error instanceof Error ? error.message : String(error)),
-        127,
-      )
-    }
-  }
-  if (shared) {
-    const reply = await call({
-      name: ctx.name,
-      cwd: ctx.cwd,
-      env: { ...ctx.env, PWD: ctx.cwd },
-      roots: unique,
-      dirs: [],
-      timeoutMs: ctx.limits.timeoutMs,
-      kind,
-      target,
-      argv: mode === 'version' ? [] : mode.argv,
-      filename: mode === 'version' ? '' : mode.filename,
-      files: [],
-      stdin: mode !== 'version' && mode.kind === 'stdin' ? '' : stdin,
-    })
-    if (reply.stdout) ctx.stdout.write(reply.stdout)
-    if (reply.stderr) ctx.stderr.write(reply.stderr)
-    if (reply.status >= 0) return reply.status
-    if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-    throw new CommandError('timed out after ' + ctx.limits.timeoutMs + ' ms', 124)
-  }
-  const send = async (request: PythonRequest): Promise<PythonReply> => {
-    const adopted = [...mirror.adopted]
-    const reply = await call(
-      adopted.length ? { ...request, stamps: [...(request.stamps ?? []), ...adopted] } : request,
-    )
-    for (const [path, stamp] of adopted)
-      if (mirror.adopted.get(path) === stamp) mirror.adopted.delete(path)
-    return reply
-  }
-  const tree = await scan(ctx.fs, unique, maxBytes, maxFiles, maxBytes)
-  if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-  const base = {
-    name: ctx.name,
-    cwd: ctx.cwd,
-    env: { ...ctx.env, PWD: ctx.cwd },
-    roots: unique,
-    dirs: [...tree.dirs],
-    timeoutMs: ctx.limits.timeoutMs,
-    mirror: mirror.id,
-    binary: true,
-  }
-  const control = {
-    ...base,
-    dirs: [],
-    kind: 'version' as const,
-    target: '',
-    argv: [],
-    filename: '',
-    stdin: '',
-    keep: [],
-  }
-  const stamped = (files: [string, string | Uint8Array][]): [string, string][] =>
-    files.map(([path]) => [path, tree.files.get(path)!])
-  const adopt = (path: string, stamp: string) => {
-    mirror.known.set(path, stamp)
-    mirror.adopted.set(path, stamp)
-  }
-  const upload = async (paths: string[]): Promise<[string, Uint8Array][]> => {
-    let batch: [string, Uint8Array][] = []
-    let bytes = 0
-    let sending: Promise<void> | undefined
-    const sync = async (files: [string, Uint8Array][]) => {
-      await sending
-      sending = send({ ...control, files, sync: true, stamps: stamped(files) }).then((reply) => {
-        if (reply.mirror !== mirror.id)
-          throw new CommandError(
-            ctx.name +
-              ': this directory holds more than one upload and the Python service does not keep files between runs; run python3 from a smaller directory',
-            127,
-          )
-        for (const [sent] of files) mirror.known.set(sent, tree.files.get(sent)!)
-      })
-      sending.catch(() => {})
-    }
-    for (const path of paths) {
-      const data = await ctx.fs.read(path).catch(() => null)
-      if (!data) continue
-      if (data.length > batchBytes) {
-        await sending
-        for (let offset = 0; offset < data.length; offset += batchBytes) {
-          const reply = await send({
-            ...control,
-            files: [[path, data.subarray(offset, offset + batchBytes)]],
-            sync: true,
-            append: offset > 0,
-            ...(offset + batchBytes >= data.length
-              ? { stamps: [[path, tree.files.get(path)!] as [string, string]] }
-              : {}),
-          })
-          if (reply.mirror !== mirror.id)
-            throw new CommandError(
-              ctx.name +
-                ': ' +
-                path +
-                ' is larger than one upload and the Python service does not keep files between runs; move it out of this directory',
-              127,
-            )
-        }
-        mirror.known.set(path, tree.files.get(path)!)
-        continue
-      }
-      if (batch.length && bytes + data.length > batchBytes) {
-        await sync(batch)
-        batch = []
-        bytes = 0
-      }
-      batch.push([path, data])
-      bytes += data.length
-    }
-    await sending
-    return batch
-  }
-  if (!mirror.known.size && tree.files.size) {
-    const listing = [...tree.files]
-    const reply = await send({ ...control, files: [], sync: true, listing })
-    if (reply.mirror === mirror.id) {
-      const missing = new Set(reply.missing ?? [])
-      for (const [path, stamp] of listing) if (!missing.has(path)) mirror.known.set(path, stamp)
-    }
-  }
-  let pending = [...tree.files.keys()].filter(
-    (path) => mirror.known.get(path) !== tree.files.get(path),
-  )
-  let reply: PythonReply | undefined
-  for (let attempt = 0; ; attempt++) {
-    const files = await upload(pending)
-    const sent = new Set(files.map(([path]) => path))
-    const keep = [...tree.files.keys()].filter(
-      (path) => !sent.has(path) && mirror.known.get(path) === tree.files.get(path),
-    )
-    reply = await send({
-      ...base,
-      kind,
-      target,
-      argv: mode === 'version' ? [] : mode.argv,
-      filename: mode === 'version' ? '' : mode.filename,
-      files,
-      keep,
-      stamps: stamped(files),
-      stdin: mode !== 'version' && mode.kind === 'stdin' ? '' : stdin,
-    })
-    if (!reply.missing?.length || attempt >= 2) break
-    for (const path of reply.missing) mirror.known.delete(path)
-    for (const [path] of files) mirror.known.set(path, tree.files.get(path)!)
-    pending = reply.missing.filter((path) => tree.files.has(path))
-  }
-  if (reply.mirror !== mirror.id) mirror.known.clear()
-  if (reply.missing?.length)
-    throw new CommandError(
-      ctx.name + ": the Python service kept losing this workspace's files; try again",
-      127,
-    )
-  leftOut(
-    ctx,
-    tree.left,
-    tree.leftBytes,
-    tree.partial,
-    'the ' + (maxBytes / 1024 / 1024).toFixed(0) + ' MiB or ' + maxFiles + '-file limit for Python',
-  )
-  if (reply.stdout) ctx.stdout.write(reply.stdout)
-  if (reply.stderr) ctx.stderr.write(reply.stderr)
-  if (unique.length) {
-    const changed = new Map<string, string | Uint8Array>()
-    const large = new Map(reply.large ?? [])
-    for (const [path, data] of reply.files) if (data !== null) changed.set(path, data)
-    for (let more = reply.more ?? []; more.length; ) {
-      const fetched = await send({ ...control, files: [], fetch: more })
-      for (const [path, data] of fetched.files) if (data !== null) changed.set(path, data)
-      for (const [path, size] of fetched.large ?? []) large.set(path, size)
-      more = fetched.more ?? []
-      if (!fetched.files.length && !fetched.large?.length) break
-    }
-    const present = new Set(reply.files.map(([path]) => path))
-    const dirs = new Set(reply.dirs)
-    const partial = (path: string) => [...tree.partial].some((dir) => within(dir, path))
-    const removals = [...tree.files.keys(), ...tree.dirs]
-      .filter((path) => !present.has(path) && !dirs.has(path))
-      .sort((a, b) => b.length - a.length)
-    for (const path of removals) {
-      if (tree.dirs.has(path) && (partial(path) || dirs.has(path))) continue
-      mirror.known.delete(path)
-      await ctx.fs.remove(path).catch((error) => {
-        if (!(error instanceof FsError)) throw error
-      })
-    }
-    for (const dir of [...dirs].sort()) if (!tree.dirs.has(dir)) await mkdirs(ctx.fs, dir)
-    for (const [path, data] of reply.files) {
-      if (data !== null || !tree.files.has(path)) continue
-      if (reply.mirror === mirror.id) mirror.known.set(path, tree.files.get(path)!)
-    }
-    for (const [path, data] of changed) {
-      await breathe()
-      await mkdirs(ctx.fs, parentOf(path))
-      await ctx.fs.write(path, typeof data === 'string' ? unbase64(data) : data)
-      const stat = await ctx.fs.stat(path)
-      if (stat && reply.mirror === mirror.id) adopt(path, stat.size + ':' + stat.mtime)
-    }
-    for (const [path, size] of large) {
-      await mkdirs(ctx.fs, parentOf(path))
-      try {
-        for (let offset = 0; offset < size || offset === 0; offset += batchBytes) {
-          const piece = await send({
-            ...control,
-            files: [],
-            fetch: [path],
-            range: [offset, batchBytes],
-          })
-          const data = piece.files[0]?.[1]
-          if (data == null)
-            throw new CommandError(
-              ctx.name + ': ' + path + ' changed while it was copied back',
-              127,
-            )
-          await ctx.fs.write(path, typeof data === 'string' ? unbase64(data) : data, offset > 0)
-          if (offset + batchBytes >= size) break
-        }
-      } catch (error) {
-        if (!(error instanceof FsError)) throw error
-        await ctx.fs.remove(path).catch(() => {})
-        mirror.known.delete(path)
-        ctx.stderr.write(
-          ctx.name +
-            ': warning: ' +
-            path +
-            ' (' +
-            (size / 1024 / 1024).toFixed(1) +
-            ' MiB) stays in the Python container: ' +
-            error.message +
-            '\n',
-        )
-        continue
-      }
-      const stat = await ctx.fs.stat(path)
-      if (stat && reply.mirror === mirror.id) adopt(path, stat.size + ':' + stat.mtime)
-    }
-  }
-  if (reply.status >= 0) return reply.status
-  if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-  throw new CommandError('timed out after ' + ctx.limits.timeoutMs + ' ms', 124)
-}
-
-function mountable(ctx: CommandContext, mode: Mode): string[] | undefined {
-  const mounts = [ctx.cwd, '/tmp', ...(mode.kind === 'file' ? [parentOf(mode.filename)] : [])]
-  const roots = mounts.filter(
-    (root, index) =>
-      mounts.indexOf(root) === index &&
-      !mounts.some((other) => other !== root && within(root, other)),
-  )
-  const free = (root: string) =>
-    root !== '/' && !reserved(root) && !RESERVED.some((prefix) => within(prefix, root))
-  return roots.every(free) ? roots : undefined
+  return { pip: handler, pip3: handler, python: handler, python3: handler, uv: handler }
 }
 
 async function erase(fs: FileSystem, path: string): Promise<void> {
@@ -1094,7 +187,7 @@ async function erase(fs: FileSystem, path: string): Promise<void> {
   await fs.remove(path)
 }
 
-async function apply(fs: FileSystem, changes: PythonChanges): Promise<void> {
+async function apply(fs: FileSystem, changes: RustPython.Changes): Promise<void> {
   for (const path of [...changes.deleted].sort((a, b) => b.length - a.length)) {
     await erase(fs, path).catch((error) => {
       if (!(error instanceof FsError)) throw error
@@ -1108,20 +201,142 @@ async function apply(fs: FileSystem, changes: PythonChanges): Promise<void> {
   }
 }
 
+function absent(missing: RustPython.Missing): string {
+  const top = missing.module.split('.')[0]
+  if (sciModules.includes(top))
+    return (
+      "python3: No module named '" +
+      top +
+      "': " +
+      top +
+      " runs on nanocode-ts's separate polars interpreter (python-polars.wasm), which this host doesn't offer; pass it as Python's sci option"
+    )
+  if (!missing.package) return missing.text
+  const head = 'python3: ' + missing.module + ': '
+  const error = missing.text.startsWith(head)
+    ? missing.text.slice(head.length).replace(/ \(this simulated shell has no [^)]*\)$/, '')
+    : missing.text
+  const named = /^No module named '([^']+)'/.exec(error)?.[1]
+  if (named === undefined) return 'python3: import ' + missing.module + ' failed: ' + error
+  if (named !== top && !missing.module.startsWith(named + '.'))
+    return (
+      "python3: No module named '" +
+      named +
+      "', which " +
+      missing.module +
+      ' imports (pip install ' +
+      named.split('.')[0] +
+      ' if it is a pure-Python package)'
+    )
+  return (
+    "python3: No module named '" +
+    top +
+    "' (nanocode's Python ships " +
+    shippedModules.join(', ') +
+    '; pure-Python packages: pip install ' +
+    top +
+    ')'
+  )
+}
+
+let compiles: boolean | undefined
+
+function canCompile(): boolean {
+  if (compiles !== undefined) return compiles
+  try {
+    new (WebAssembly as unknown as { Module: new (bytes: Uint8Array) => unknown }).Module(
+      new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]),
+    )
+    compiles = true
+  } catch {
+    compiles = false
+  }
+  return compiles
+}
+
 const packagedRust: { module?: Promise<WebAssembly.Module | undefined> } = {}
+
+const packagedPython = '../../../python.wasm'
+
+const packagedImage = '../../../python.data'
+
+const imageLoads = new WeakMap<WebAssembly.Module, Promise<string | undefined>>()
+
+type Data = Uint8Array | ArrayBuffer
+
+async function packagedData(): Promise<Data | undefined> {
+  const process = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } })
+    .process
+  const fs = process?.getBuiltinModule?.('node:fs') as
+    | { promises: { readFile(path: URL): Promise<Uint8Array> } }
+    | undefined
+  const meta = import.meta as { resolve?: (specifier: string) => string; url?: string }
+  const url = meta.resolve
+    ? new URL(meta.resolve('nanocode-ts/python.data'))
+    : meta.url
+      ? new URL(packagedImage, meta.url)
+      : undefined
+  if (!fs || !url) return undefined
+  return fs.promises.readFile(url)
+}
+
+// Loads python.data once per module and isolate; a failed load is retried on the next run.
+function rustImage(
+  options: PythonOptions,
+  module: WebAssembly.Module,
+): Promise<string | undefined> {
+  if (!RustPython.needsImage(module)) return Promise.resolve(undefined)
+  let loading = imageLoads.get(module)
+  if (!loading) {
+    loading = (async () => {
+      const data = await (typeof options.data === 'function'
+        ? options.data()
+        : (options.data ?? packagedData()))
+      if (!data) return NO_IMAGE
+      await RustPython.provide(module, data)
+      return undefined
+    })().catch(
+      (error: unknown) =>
+        NO_IMAGE + ': ' + (error instanceof Error ? error.message : String(error)),
+    )
+    imageLoads.set(module, loading)
+    void loading.then((failed) => {
+      if (failed) imageLoads.delete(module)
+    })
+  }
+  return loading
+}
+
+const moduleLoads = new WeakMap<() => Promise<WebAssembly.Module>, Promise<WebAssembly.Module>>()
+
+function loadModule(load: () => Promise<WebAssembly.Module>): Promise<WebAssembly.Module> {
+  let loading = moduleLoads.get(load)
+  if (!loading) {
+    loading = load()
+    moduleLoads.set(load, loading)
+    loading.catch(() => moduleLoads.delete(load))
+  }
+  return loading
+}
 
 function rustModule(options: PythonOptions): Promise<WebAssembly.Module | undefined> {
   if (options.module === false) return Promise.resolve(undefined)
-  if (options.module) return Promise.resolve(options.module)
+  if (options.module instanceof WebAssembly.Module) return Promise.resolve(options.module)
+  if (options.module) return loadModule(options.module)
   packagedRust.module ??= (async () => {
     const process = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } })
       .process
     const fs = process?.getBuiltinModule?.('node:fs') as
       | { promises: { readFile(path: URL): Promise<Uint8Array> } }
       | undefined
-    const resolve = (import.meta as { resolve?: (specifier: string) => string }).resolve
-    if (!fs || !resolve || !canCompile()) return undefined
-    const bytes = await fs.promises.readFile(new URL(resolve('nanocode-ts/python.wasm')))
+    const meta = import.meta as { resolve?: (specifier: string) => string; url?: string }
+    const url = meta.resolve
+      ? new URL(meta.resolve('nanocode-ts/python.wasm'))
+      : meta.url
+        ? new URL(packagedPython, meta.url)
+        : undefined
+    if (!fs || !url || !canCompile()) return undefined
+    const bytes = await fs.promises.readFile(url)
     const compile = (
       WebAssembly as unknown as { compile(bytes: Uint8Array): Promise<WebAssembly.Module> }
     ).compile
@@ -1130,226 +345,38 @@ function rustModule(options: PythonOptions): Promise<WebAssembly.Module | undefi
   return packagedRust.module
 }
 
-function warmRust(module: WebAssembly.Module): void {
-  const files: SyncFileSystem = {
-    list: () => [],
-    mkdir: (path) => {
-      throw new FsError('EROFS', path)
-    },
-    read: (path) => {
-      throw new FsError('ENOENT', path)
-    },
-    remove: (path) => {
-      throw new FsError('EROFS', path)
-    },
-    rename: (from) => {
-      throw new FsError('EROFS', from)
-    },
-    stat: (path) => (path === '/' ? { kind: 'directory', mode: 0o755, mtime: 0, size: 0 } : null),
-    write: (path) => {
-      throw new FsError('EROFS', path)
-    },
-  }
-  RustPython.run(module, {
-    files,
-    request: {
-      argv: ['-c', 'pass'],
-      cwd: '/',
-      depth: 1000,
-      env: {},
-      file: 0,
-      memory: Number.MAX_SAFE_INTEGER,
-      output: 0,
-      stdin: new Uint8Array(),
-      steps: Number.MAX_SAFE_INTEGER,
-      timeMs: Number.MAX_SAFE_INTEGER,
-    },
-    stopped: () => false,
-  })
-}
-
-function layered(fs: FileSystem): {
-  changes(): PythonChanges
-  fetch(): Promise<void>
-  files: SyncFileSystem
-  missed(): boolean
-  reset(): void
-} {
-  const stats = new Map<string, FileStat | null>()
-  const names = new Map<string, string[]>()
-  const bytes = new Map<string, Uint8Array>()
-  const wanted = {
-    list: new Set<string>(),
-    read: new Set<string>(),
-    stat: new Set<string>(),
-    tree: new Set<string>(),
-  }
-  let missing = false
-  let files = new Map<string, Uint8Array>()
-  let dirs = new Set<string>()
-  let gone = new Set<string>()
-  let touched = new Set<string>()
-  let made = new Set<string>()
-  const miss = (set: Set<string>, path: string) => {
-    set.add(path)
-    missing = true
-    return new FsError('EIO', path)
-  }
-  const hidden = (path: string) => {
-    if (files.has(path) || dirs.has(path)) return false
-    for (let at = path; ; at = parentOf(at)) {
-      if (gone.has(at)) return true
-      if (at === '/') return false
-    }
-  }
-  const kind = (path: string): 'file' | 'directory' | undefined => {
-    if (files.has(path)) return 'file'
-    if (dirs.has(path)) return 'directory'
-    if (hidden(path)) return undefined
-    if (!stats.has(path)) throw miss(wanted.stat, path)
-    return stats.get(path)?.kind
-  }
-  const read = (path: string) => {
-    const own = files.get(path)
-    if (own) return own
-    const found = kind(path)
-    if (found !== 'file') throw new FsError(found ? 'EISDIR' : 'ENOENT', path)
-    const data = bytes.get(path)
-    if (!data) throw miss(wanted.read, path)
-    return data
-  }
-  const list = (path: string) => {
-    const found = kind(path)
-    if (found !== 'directory') throw new FsError(found ? 'ENOTDIR' : 'ENOENT', path)
-    const listed = new Set<string>()
-    if (!made.has(path) && !hidden(path)) {
-      const base = names.get(path)
-      if (!base) throw miss(wanted.list, path)
-      for (const name of base) if (!hidden(join(path, name))) listed.add(name)
-    }
-    for (const key of [...files.keys(), ...dirs])
-      if (key !== '/' && parentOf(key) === path)
-        listed.add(key.slice(path === '/' ? 1 : path.length + 1))
-    return [...listed].sort()
-  }
-  const parent = (path: string) => {
-    if (kind(parentOf(path)) !== 'directory') throw new FsError('ENOENT', path)
-  }
-  const remove = (path: string) => {
-    files.delete(path)
-    dirs.delete(path)
-    touched.delete(path)
-    made.delete(path)
-    gone.add(path)
-  }
-  const write = (path: string, data: Uint8Array, append?: boolean) => {
-    if (kind(path) === 'directory') throw new FsError('EISDIR', path)
-    parent(path)
-    const before = append && kind(path) === 'file' ? read(path) : undefined
-    const joined = before ? new Uint8Array(before.length + data.length) : data
-    if (before) {
-      joined.set(before)
-      joined.set(data, before.length)
-    }
-    files.set(path, joined)
-    touched.add(path)
-  }
-  const copy = (from: string, to: string) => {
-    if (kind(from) === 'file') return write(to, read(from))
-    dirs.add(to)
-    made.add(to)
-    for (const name of list(from)) copy(join(from, name), join(to, name))
-  }
-  const fetchTree = async (path: string): Promise<void> => {
-    const stat = await fs.stat(path)
-    stats.set(path, stat)
-    if (stat?.kind === 'file') bytes.set(path, await fs.read(path))
-    if (stat?.kind !== 'directory') return
-    const children = await fs.list(path)
-    names.set(path, children)
-    for (const name of children) await fetchTree(join(path, name))
-  }
-  return {
-    changes: () => ({
-      deleted: [...gone].filter((path) => kind(path) === undefined),
-      dirs: [...made].filter((path) => dirs.has(path)),
-      files: new Map(
-        [...touched].flatMap((path) => {
-          const data = files.get(path)
-          return data ? [[path, data] as const] : []
-        }),
-      ),
-    }),
-    async fetch() {
-      for (const path of wanted.stat) stats.set(path, await fs.stat(path))
-      for (const path of wanted.list) {
-        const children = await fs.list(path)
-        names.set(path, children)
-        for (const name of children) {
-          const child = join(path, name)
-          if (!stats.has(child)) stats.set(child, await fs.stat(child))
-        }
-      }
-      for (const path of wanted.read) bytes.set(path, await fs.read(path))
-      for (const path of wanted.tree) await fetchTree(path)
-      for (const set of Object.values(wanted)) set.clear()
-    },
-    files: {
-      list,
-      mkdir: (path) => {
-        if (kind(path)) throw new FsError('EEXIST', path)
-        parent(path)
-        dirs.add(path)
-        made.add(path)
-      },
-      read,
-      remove: (path) => {
-        if (!kind(path)) throw new FsError('ENOENT', path)
-        remove(path)
-      },
-      rename: (from, to) => {
-        const found = kind(from)
-        if (!found) throw new FsError('ENOENT', from)
-        if (found === 'directory' && !bytes.has(from) && !names.has(from) && !made.has(from))
-          throw miss(wanted.tree, from)
-        parent(to)
-        if (kind(to)) remove(to)
-        try {
-          copy(from, to)
-        } catch (error) {
-          if (missing) wanted.tree.add(from)
-          throw error
-        }
-        remove(from)
-      },
-      stat: (path) => {
-        const found = kind(path)
-        if (!found) return null
-        if (files.has(path))
-          return {
-            kind: 'file',
-            mode: 0o644,
-            mtime: Date.now(),
-            size: files.get(path)?.length ?? 0,
-          }
-        if (dirs.has(path)) return { kind: 'directory', mode: 0o755, mtime: Date.now(), size: 0 }
-        return stats.get(path) ?? null
-      },
-      write,
-    },
-    missed: () => missing,
-    reset() {
-      missing = false
-      files = new Map()
-      dirs = new Set()
-      gone = new Set()
-      touched = new Set()
-      made = new Set()
-    },
-  }
-}
-
 const notFound = 127
+
+type Known = {
+  effects: Journal.Effects
+  exited: RustPython.Exited
+  key: string
+  replaced: boolean
+}
+
+function changing(child: RustPython.Child): RustPython.Exited {
+  return {
+    status: refusedStatus,
+    stderr: encode(
+      program(child.argv[0] ?? '') +
+        ': python3 runs this command by running the script again up to it, and the script asked for a different command each time; make the command depend only on the files and earlier commands, not on the time or random numbers\n',
+    ),
+    stdout: new Uint8Array(),
+  }
+}
+
+function words(argv: readonly string[]): string {
+  return [program(argv[0] ?? ''), ...argv.slice(1)]
+    .map((word) => "'" + word.replaceAll("'", "'\\''") + "'")
+    .join(' ')
+}
+
+function shellScript(argv: readonly string[]): string | undefined {
+  const name = program(argv[0] ?? '')
+  return (name === 'sh' || name === 'bash') && argv[1] === '-c' && argv.length === 3
+    ? argv[2]
+    : undefined
+}
 
 const refusedStatus = 126
 
@@ -1367,378 +394,475 @@ async function executeRust(
   options: {
     cpuMs: number | undefined
     engine: Psh.Instance | undefined
-    fallback: boolean
+    host: Host | undefined
     maxBytes: number
+    sci?: readonly string[] | undefined
     stdin: string
     stepsPerMs: number | undefined
   },
-): Promise<number | undefined> {
+): Promise<number | 'sci'> {
   const limit = Math.min(options.maxBytes, Math.floor(ctx.limits.maxMemoryBytes / 2))
   const cpuMs = Math.min(ctx.limits.timeoutMs, options.cpuMs ?? ctx.limits.timeoutMs)
   const deadline = Date.now() + ctx.limits.timeoutMs
-  const cache = ctx.fs.sync ? undefined : layered(ctx.fs)
-  const files = ctx.fs.sync ?? cache?.files
-  if (!files) return undefined
+  const cache = ctx.fs.sync ? undefined : RustPython.layered(ctx.fs, { limits: ctx.limits })
+  const journal = Journal.create(ctx.fs.sync ?? cache!.files, {
+    bytes: ctx.limits.maxMemoryBytes,
+  })
+  const files = journal.files
   const engine = options.engine
-  const spawn: RustPython.Spawn | undefined =
-    engine &&
-    ((child) => {
-      const fs: FileSystem = {
-        list: async (path) => files.list(path),
-        mkdir: async (path) => files.mkdir(path),
-        read: async (path) => files.read(path),
-        remove: async (path) => files.remove(path),
-        rename: async (from, to) => files.rename(from, to),
-        stat: async (path) => files.stat(path),
-        sync: files,
-        write: async (path, data, append) => files.write(path, data, append),
+  const host = options.host
+  const known: Known[] = []
+  let spawned = 0
+  let replaced = false
+  const tape: RustPython.Tape = {
+    clock: [],
+    clockAt: 0,
+    random: [],
+    randomAt: 0,
+    time: [],
+    timeAt: 0,
+  }
+  let pending:
+    | {
+        at: number
+        child: RustPython.Child
+        clock: number
+        key: string
+        mark: Journal.Mark
+        random: number
+        time: number
       }
-      const name = program(child.argv[0] ?? '')
-      const ran = Psh.runNow(engine, {
-        commandFs: fs,
-        commands: new Map(),
-        cwd: child.cwd,
-        env: child.env,
-        fetch: undefined,
-        fs,
-        identity: Psh.identity(child.env),
-        kept: undefined,
-        limits: {
-          depth: ctx.limits.maxCallDepth,
-          file: ctx.limits.maxMemoryBytes,
-          fuel: ctx.limits.maxCommands,
-          memory: ctx.limits.maxMemoryBytes,
-          operations: ctx.limits.maxFileOperations,
-          output: ctx.limits.maxOutputLength,
-        },
-        machine: undefined,
-        script:
-          [name, ...child.argv.slice(1)].map((word) => "'" + word.replaceAll("'", "'\\''") + "'").join(' ') +
-          (child.merged ? ' 2>&1' : ''),
-        shellLimits: ctx.limits,
-        signal: ctx.signal,
-        stdin: child.stdin,
-        strict: false,
-        without: ['curl', 'wget'],
-      })
-      if (!ran) return 'EAGAIN'
-      if (ran.ended === 'cancelled') return 'EINTR'
-      if (ran.ended === 'exited' && ran.status === notFound && ran.missing.includes(name))
-        return 'ENOENT'
-      if (ran.ended === 'exited') return { status: ran.status, stderr: ran.stderr, stdout: ran.stdout }
-      return {
-        status: refusedStatus,
-        stderr: encode(name + ': it ran more than this shell allows\n'),
-        stdout: ran.stdout,
-      }
-    })
-  const attempt = () =>
-    RustPython.run(module, {
-      files,
-      request: {
-        argv: ctx.args,
-        cwd: ctx.cwd,
+    | undefined
+  const now = (child: RustPython.Child): RustPython.Exited | 'host' | FsError['code'] => {
+    const name = program(child.argv[0] ?? '')
+    if (!engine) return 'host'
+    const fs: FileSystem = {
+      list: async (path) => files.list(path),
+      mkdir: async (path) => files.mkdir(path),
+      read: async (path) => files.read(path),
+      remove: async (path) => files.remove(path),
+      rename: async (from, to) => files.rename(from, to),
+      stat: async (path) => files.stat(path),
+      sync: files,
+      write: async (path, data, append) => files.write(path, data, append),
+    }
+    const ran = Psh.runNow(engine, {
+      commandFs: fs,
+      commands: new Map(),
+      cwd: child.cwd,
+      env: child.env,
+      fetch: undefined,
+      fs,
+      identity: Psh.identity(child.env),
+      kept: undefined,
+      limits: {
         depth: ctx.limits.maxCallDepth,
-        env: { ...ctx.env, PWD: ctx.cwd },
-        file: limit,
+        file: ctx.limits.maxMemoryBytes,
+        fuel: ctx.limits.maxCommands,
         memory: ctx.limits.maxMemoryBytes,
+        operations: ctx.limits.maxFileOperations,
         output: ctx.limits.maxOutputLength,
-        stdin: encode(options.stdin),
-        steps:
-          options.stepsPerMs === undefined
-            ? Number.MAX_SAFE_INTEGER
-            : Math.ceil(cpuMs * options.stepsPerMs),
-        timeMs: deadline - Date.now(),
       },
-      spawn,
-      stopped: () => ctx.signal.aborted || (cache?.missed() ?? false),
+      machine: undefined,
+      script: words(child.argv) + (child.merged ? ' 2>&1' : ''),
+      shellLimits: ctx.limits,
+      signal: ctx.signal,
+      stdin: child.stdin,
+      strict: false,
+      without: ['curl', 'wget'],
     })
-  let ran = attempt()
-  while (cache?.missed()) {
-    await cache.fetch()
-    cache.reset()
-    ran = attempt()
+    if (!ran) return host ? 'host' : 'EAGAIN'
+    if (ran.ended === 'cancelled') return 'EINTR'
+    if (host && ran.missing.some((missing) => host.has(missing))) return 'host'
+    if (ran.ended === 'exited' && ran.status === notFound && ran.missing.includes(name))
+      return 'ENOENT'
+    if (ran.ended === 'exited')
+      return { status: ran.status, stderr: ran.stderr, stdout: ran.stdout }
+    return {
+      status: refusedStatus,
+      stderr: encode(name + ': it ran more than this shell allows\n'),
+      stdout: ran.stdout,
+    }
+  }
+  const spawn: RustPython.Spawn | undefined =
+    (engine || host) &&
+    ((child) => {
+      if (pending) return 'EAGAIN'
+      try {
+        return start(child)
+      } catch (error) {
+        if (error instanceof FsError) return error.code
+        throw error
+      }
+    })
+  const start = (child: RustPython.Child): ReturnType<RustPython.Spawn> => {
+    const at = spawned++
+    const key = JSON.stringify([
+      child.argv,
+      child.cwd,
+      child.env,
+      child.merged,
+      decode(child.stdin),
+    ])
+    const before = known[at]
+    if (before?.key === key) {
+      journal.replay(before.effects)
+      return before.exited
+    }
+    if (before?.replaced) return changing(child)
+    if (before) known.length = at
+    const mark = journal.mark()
+    const ran = now(child)
+    if (typeof ran === 'object') {
+      if (!cache?.missed())
+        known.push({
+          effects: journal.capture(journal.touched(mark)),
+          exited: ran,
+          key,
+          replaced: false,
+        })
+      return ran
+    }
+    if (ran !== 'host') return ran
+    replaced = before !== undefined
+    journal.rollback(mark)
+    const name = program(child.argv[0] ?? '')
+    if (shellScript(child.argv) === undefined && !host!.has(name)) return 'ENOENT'
+    if (journal.overflowed()) return 'ENOMEM'
+    pending = {
+      at,
+      child,
+      clock: tape.clockAt,
+      key,
+      mark,
+      random: tape.randomAt,
+      time: tape.timeAt,
+    }
+    return 'EAGAIN'
+  }
+  const request = (): RustPython.Request => ({
+    argv: ctx.args,
+    cwd: ctx.cwd,
+    depth: ctx.limits.maxCallDepth,
+    env: { ...ctx.env, PWD: ctx.cwd },
+    file: limit,
+    memory: ctx.limits.maxMemoryBytes,
+    output: ctx.limits.maxOutputLength,
+    stdin: encode(options.stdin),
+    steps:
+      options.stepsPerMs === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : Math.ceil(cpuMs * options.stepsPerMs),
+    timeMs: deadline - Date.now(),
+  })
+  const stopped = () => ctx.signal.aborted || pending !== undefined || (cache?.missed() ?? false)
+  const attempt = (): Promise<RustPython.Ran> =>
+    RustPython.suspends
+      ? RustPython.runAsync(module, {
+          files,
+          fresh: known.length > 0,
+          request: request(),
+          retry,
+          spawn: suspended,
+          stopped,
+          tape,
+        })
+      : Promise.resolve(
+          RustPython.run(module, {
+            files,
+            fresh: known.length > 0,
+            request: request(),
+            spawn,
+            stopped,
+            tape,
+          }),
+        )
+  const retry = cache
+    ? async () => {
+        if (!cache.missed()) return false
+        await cache.fetch()
+        cache.settle()
+        return true
+      }
+    : undefined
+  const hosted = async (at: number, child: RustPython.Child, key: string) => {
+    const started = journal.mark()
+    const script = shellScript(child.argv) ?? words(child.argv)
+    const exited = await host!.run({
+      cwd: child.cwd,
+      env: child.env,
+      fs: Journal.view(files, { retry }),
+      script: child.merged ? '{ ' + script + '\n} 2>&1' : script,
+      signal: ctx.signal,
+      stdin: child.stdin,
+    })
+    const touched = journal.touched(started)
+    let effects: Journal.Effects | undefined
+    while (!effects)
+      try {
+        effects = journal.capture(touched)
+      } catch (error) {
+        if (!retry || !(await retry())) throw error
+      }
+    known.length = at
+    known.push({ effects, exited, key, replaced })
+    return exited
+  }
+  const nests = (child: RustPython.Child) =>
+    child.argv.some((word) => word.includes('python')) &&
+    !RustPython.fits(module, ctx.limits.maxMemoryBytes)
+  const resumed = async (
+    child: RustPython.Child,
+    at: number,
+    mark: Journal.Mark,
+  ): Promise<RustPython.Exited | FsError['code']> => {
+    for (;;) {
+      journal.rollback(mark)
+      spawned = at
+      known.length = at
+      pending = undefined
+      await retry!()
+      const ran = spawn!(child)
+      if (!cache!.missed()) return onward(child, at, ran)
+    }
+  }
+  const onward = (
+    child: RustPython.Child,
+    at: number,
+    ran: RustPython.Exited | FsError['code'],
+  ): RustPython.Exited | FsError['code'] | Promise<RustPython.Exited | FsError['code']> => {
+    if (ran !== 'EAGAIN' || !pending || !host || nests(pending.child)) return ran
+    const { key } = pending
+    pending = undefined
+    return hosted(at, child, key).catch((error: unknown) => {
+      if (error instanceof FsError) return error.code
+      throw error
+    })
+  }
+  const suspended: RustPython.Suspended | undefined =
+    spawn &&
+    ((child) => {
+      const at = spawned
+      const mark = journal.mark()
+      const ran = spawn(child)
+      return cache?.missed() ? resumed(child, at, mark) : onward(child, at, ran)
+    })
+  const again = () => {
+    if (cache) cache.reset()
+    else journal.rollback({ first: 0, changes: 0 })
+    journal.clear()
+    spawned = 0
+    pending = undefined
+    tape.clockAt = 0
+    tape.randomAt = 0
+    tape.timeAt = 0
+    return attempt()
+  }
+  await cache?.probe([ctx.cwd, sitePackages])
+  let ran = await attempt()
+  for (;;) {
+    if (cache?.missed()) {
+      await cache.fetch()
+      ran = await again()
+      continue
+    }
+    if (!pending || !host || ctx.signal.aborted) break
+    const { at, child, key, mark } = pending
+    tape.clock.length = pending.clock
+    tape.random.length = pending.random
+    tape.time.length = pending.time
+    journal.rollback(mark)
+    await hosted(at, child, key)
+    ran = await again()
+  }
+  const notImported =
+    ran.kind === 'needs'
+      ? ran.missing.map((missing) => missing.module.split('.')[0]!)
+      : ran.kind === 'exited' && ran.status !== 0
+        ? uncaughtImport(decode(ran.stderr))
+        : []
+  if (
+    options.sci &&
+    !ctx.signal.aborted &&
+    notImported.some((name) => options.sci!.includes(name))
+  ) {
+    if (!cache) journal.rollback({ first: 0, changes: 0 })
+    return 'sci'
   }
   if (cache) await apply(ctx.fs, cache.changes())
-  if (ran.kind !== 'needs')
-    return RustPython.report(ctx, ran, { cpuMs, stepsPerMs: options.stepsPerMs })
-  if (options.fallback && ran.missing.every((missing) => missing.package)) return undefined
-  for (const missing of ran.missing) ctx.stderr.write(missing.text + '\n')
+  if (ran.kind !== 'needs') {
+    const status = RustPython.report(ctx, ran, {
+      cpuMs,
+      stepsPerMs: options.stepsPerMs,
+    })
+    for (const name of notImported)
+      if (sciModules.includes(name))
+        ctx.stderr.write(absent({ module: name, package: false, text: '' }) + '\n')
+    return status
+  }
+  for (const missing of ran.missing) ctx.stderr.write(absent(missing) + '\n')
   return 127
 }
 
-async function executeThreaded(
-  ctx: CommandContext,
-  mode: Mode | 'version',
-  stdin: string,
-  maxBytes: number,
-  maxFiles: number,
-  mirror: string,
-): Promise<number> {
-  if (mode === 'version') {
-    ctx.stdout.write('Python ' + (await workerVersion(HELPER, packageCacheDir())) + '\n')
-    return 0
-  }
-  const roots = [ctx.cwd, '/tmp', ...(mode.kind === 'file' ? [mode.filename] : [])].filter(
-    (root) => !reserved(root),
-  )
-  const unique = roots.filter(
-    (root, index) =>
-      roots.indexOf(root) === index &&
-      !roots.some((other) => other !== root && within(root, other)),
-  )
-  const target =
-    mode.kind === 'stdin'
-      ? stdin
-      : mode.kind === 'file'
-        ? new TextDecoder().decode(await ctx.fs.read(mode.filename))
-        : mode.target
-  const env = { ...ctx.env, PWD: ctx.cwd, PYTHONDONTWRITEBYTECODE: '1' }
-  const path0 =
-    mode.kind === 'file' ? parentOf(mode.filename) : mode.kind === 'module' ? ctx.cwd : ''
-  const cacheDir = packageCacheDir()
-  const lazy = mountable(ctx, mode)
-  if (lazy)
-    return workerExclusive(async () => {
-      const result = await workerRun(HELPER, cacheDir, ctx, {
-        kind: mode.kind,
-        name: ctx.name,
-        target,
-        argv: mode.argv,
-        filename: mode.filename,
-        cwd: ctx.cwd,
-        env,
-        path0,
-        roots: lazy,
-        files: [],
-        stdin: encode(mode.kind === 'stdin' ? '' : stdin),
-        lazy: true,
-      })
-      await apply(ctx.fs, result.changes)
-      if (result.failure !== undefined) throw result.failure
-      if (result.status >= 0) return result.status
-      if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-      throw new CommandError('timed out after ' + ctx.limits.timeoutMs + ' ms', 124)
-    })
-  const done = await workerExclusive(async () => {
-    const listing = await scan(ctx.fs, unique, maxBytes, maxFiles, maxBytes)
-    leftOut(
-      ctx,
-      listing.left,
-      listing.leftBytes,
-      listing.partial,
-      'the ' +
-        (maxBytes / 1024 / 1024).toFixed(0) +
-        ' MiB or ' +
-        maxFiles +
-        '-file limit for Python',
-    )
-    if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-    const need = await workerSync(HELPER, cacheDir, {
-      mirror,
-      roots: unique,
-      files: [...listing.files],
-      dirs: [...listing.dirs],
-    })
-    const files: [string, Uint8Array, string][] = []
-    for (const path of need) {
-      await breathe()
-      const data = await ctx.fs.read(path).catch(() => null)
-      if (data) files.push([path, data, listing.files.get(path)!])
-    }
-    const result = await workerRun(HELPER, cacheDir, ctx, {
-      kind: mode.kind,
-      name: ctx.name,
-      target,
-      argv: mode.argv,
-      filename: mode.filename,
-      cwd: ctx.cwd,
-      env,
-      path0,
-      roots: unique,
-      files,
-      stdin: encode(mode.kind === 'stdin' ? '' : stdin),
-    })
-    const { changes } = result
-    for (const path of [...changes.deleted].sort((a, b) => b.length - a.length)) {
-      await ctx.fs.remove(path).catch((error) => {
-        if (!(error instanceof FsError)) throw error
-      })
-    }
-    for (const dir of [...changes.dirs].sort())
-      if (!listing.dirs.has(dir)) await mkdirs(ctx.fs, dir)
-    const stamps: [string, string][] = []
-    for (const [path, data] of changes.files) {
-      await breathe()
-      await mkdirs(ctx.fs, parentOf(path))
-      await ctx.fs.write(path, data)
-      const stat = await ctx.fs.stat(path)
-      if (stat) stamps.push([path, stat.size + ':' + stat.mtime])
-    }
-    if (stamps.length) await workerStamps(HELPER, cacheDir, stamps)
-    return result
-  })
-  if (done.failure !== undefined) throw done.failure
-  if (done.status >= 0) return done.status
-  if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-  throw new CommandError('timed out after ' + ctx.limits.timeoutMs + ' ms', 124)
+const sciModules: readonly string[] = ['polars']
+
+function uncaughtImport(stderr: string): string[] {
+  const match = /ModuleNotFoundError: No module named '([A-Za-z_]\w*)[.']\S*\s*$/.exec(stderr)
+  return match ? [match[1]!] : []
 }
 
-async function execute(
+const importLines =
+  /(?:^|;)[ \t]*(?:from[ \t]+([A-Za-z_]\w*)[\w.]*[ \t]+import\b|import[ \t]+([^\n#;]+))/gm
+
+export function importing(source: string, modules: readonly string[]): boolean {
+  for (const match of source.matchAll(importLines)) {
+    const names = match[1]
+      ? [match[1]]
+      : match[2]!.split(',').map((part) => part.trim().split(/[\s.]/)[0]!)
+    if (names.some((name) => modules.includes(name))) return true
+  }
+  return modules.some((name) =>
+    new RegExp('(?:__import__|import_module)\\(\\s*[\'"]' + name + '(?:[\'".])').test(source),
+  )
+}
+
+async function readText(fs: FileSystem, path: string): Promise<string | undefined> {
+  try {
+    const stat = await fs.stat(path)
+    if (stat?.kind !== 'file') return undefined
+    return decode(await fs.read(path))
+  } catch {
+    return undefined
+  }
+}
+
+async function importsAny(
   ctx: CommandContext,
-  python: Instance,
-  mode: Mode | 'version',
+  mode: Mode,
   stdin: string,
-  maxBytes: number,
-  maxFiles: number,
+  modules: readonly string[],
+): Promise<boolean> {
+  if (mode.kind === 'code') return importing(mode.target, modules)
+  if (mode.kind === 'stdin') return importing(stdin, modules)
+  if (mode.kind === 'file') return importing((await readText(ctx.fs, mode.filename)) ?? '', modules)
+  if (mode.kind !== 'module') return false
+  if (modules.includes(mode.target.split('.')[0]!)) return true
+  const base = join(ctx.cwd, mode.target.replaceAll('.', '/'))
+  const source =
+    (await readText(ctx.fs, base + '.py')) ?? (await readText(ctx.fs, base + '/__main__.py'))
+  return importing(source ?? '', modules)
+}
+
+const skipped = new Set(['.git', 'node_modules'])
+
+async function gather(
+  ctx: CommandContext,
+  cap: number,
+): Promise<{ files: Map<string, Uint8Array>; left: number }> {
+  const files = new Map<string, Uint8Array>()
+  const seen = new Set<string>()
+  let bytes = 0
+  let left = 0
+  const visit = async (path: string): Promise<void> => {
+    if (seen.has(path)) return
+    seen.add(path)
+    const stat = await (ctx.fs.lstat ? ctx.fs.lstat(path) : ctx.fs.stat(path)).catch(() => null)
+    if (!stat) return
+    if (stat.kind === 'directory') {
+      const names = await ctx.fs.list(path).catch(() => [] as string[])
+      for (const name of names.sort()) if (!skipped.has(name)) await visit(join(path, name))
+      return
+    }
+    if (stat.kind !== 'file') return
+    if (bytes + stat.size > cap) {
+      left++
+      return
+    }
+    await breathe()
+    const data = await ctx.fs.read(path).catch(() => undefined)
+    if (!data) return
+    files.set(path, data)
+    bytes += data.length
+  }
+  const sources = [...ctx.args]
+  for (const arg of ctx.args)
+    if (!arg.startsWith('-') && arg !== '/') {
+      const path = ctx.resolve(arg)
+      const stat = await ctx.fs.stat(path).catch(() => null)
+      if (stat?.kind !== 'file') continue
+      await visit(path)
+      if (path.endsWith('.py')) sources.push((await readText(ctx.fs, path)) ?? '')
+    }
+  for (const source of sources)
+    for (const match of source.matchAll(/["'](\/[^"'\n*?]+)["']/g))
+      if (match[1] !== '/' && !match[1]!.startsWith('/dev/') && !match[1]!.startsWith('/proc/'))
+        await visit(match[1]!.replace(/\/+$/, ''))
+  if (ctx.cwd !== '/') await visit(ctx.cwd)
+  await visit(sitePackages)
+  return { files, left }
+}
+
+async function runSci(
+  ctx: CommandContext,
+  sci: Sci,
+  run: Parameters<typeof executeRust>[2],
 ): Promise<number> {
-  const pyodide = python.pyodide
-  if (mode === 'version') {
-    ctx.stdout.write(
-      'Python ' + String(pyodide.runPython('import sys; sys.version.split()[0]')) + '\n',
-    )
-    return 0
-  }
-
-  const roots = [ctx.cwd, '/tmp', ...(mode.kind === 'file' ? [mode.filename] : [])].filter(
-    (root) => !reserved(root),
-  )
-  const unique = roots.filter(
-    (root, index) =>
-      roots.indexOf(root) === index &&
-      !roots.some((other) => other !== root && within(root, other)),
-  )
-  pyodide.FS.chdir('/')
-  for (const path of python.mirrored) unmirror(pyodide.FS, path)
-  const mounts = ctx.fs.sync && mode.kind !== 'pip' ? mountable(ctx, mode) : undefined
-  const lazy = mounts && ctx.fs.sync ? Lazy.attach(pyodide, ctx.fs.sync, mounts) : undefined
-  python.mirrored = new Set(lazy ? [] : unique)
-  const snap = await snapshot(
-    ctx.fs,
-    lazy ? [] : unique,
-    Math.min(maxBytes, Math.floor(ctx.limits.maxMemoryBytes / 2)),
-    maxFiles,
-  )
-  leftOut(
-    ctx,
-    snap.left,
-    snap.leftBytes,
-    snap.partial,
-    'the ' +
-      (Math.min(maxBytes, Math.floor(ctx.limits.maxMemoryBytes / 2)) / 1024 / 1024).toFixed(0) +
-      ' MiB or ' +
-      maxFiles +
-      '-file limit for Python',
-  )
-  mirror(pyodide.FS, snap)
-  pyodide.FS.mkdirTree(ctx.cwd)
-
-  const messages = {
-    messageCallback: () => {},
-    errorCallback: (message: string) => ctx.stderr.write(message + '\n'),
-  }
-  if (mode.kind === 'stdin') mode.target = stdin
-  if (mode.kind === 'file')
-    mode.target = new TextDecoder().decode(
-      snap.files.get(mode.filename) ?? (await ctx.fs.read(mode.filename)),
-    )
-  try {
-    if (mode.kind === 'pip' && !python.micropip) {
-      await pyodide.loadPackage('micropip', messages)
-      python.micropip = true
+  if (sci.module) {
+    const compiled =
+      sci.module instanceof WebAssembly.Module ? sci.module : await loadModule(sci.module)
+    const missing = await rustImage({ data: sci.data }, compiled)
+    if (missing) {
+      ctx.stderr.write(missing.replace('python.data', 'python-polars.data') + '\n')
+      return 126
     }
-    if (mode.kind === 'module')
-      await pyodide.loadPackagesFromImports('import ' + mode.target, messages)
-    else if (mode.kind !== 'pip') await pyodide.loadPackagesFromImports(mode.target, messages)
-  } catch (error) {
+    const status = await executeRust(ctx, compiled, { ...run, sci: undefined })
+    return status === 'sci' ? 127 : status
+  }
+  const cap = sci.sendBytes ?? ctx.limits.maxMemoryBytes
+  const { files, left } = await gather(ctx, cap)
+  if (left) {
     ctx.stderr.write(
-      ctx.name + ': ' + (error instanceof Error ? error.message : String(error)) + '\n',
+      'python3: the scientific interpreter was not dispatched: ' +
+        left +
+        ' files exceed sendBytes=' +
+        cap +
+        '\n',
     )
+    return 1
   }
-
-  if (ctx.signal.aborted) throw new CommandError('interrupted', 130)
-  const deadline = Date.now() + ctx.limits.timeoutMs
-  let failure: unknown
-  let quiet = false
-  let signalled = 0
-  const stopped = () =>
-    !quiet && (failure !== undefined || ctx.signal.aborted || Date.now() > deadline)
-  const input = encode(mode.kind === 'stdin' ? '' : stdin)
-  let offset = 0
-  const sink = (target: CommandContext['stdout']) => {
-    return {
-      isatty: false,
-      flush: () => undefined,
-      write(buffer: Uint8Array) {
-        try {
-          target.write(decode(buffer))
-        } catch (error) {
-          failure ??= error
-        }
-        return buffer.length
-      },
-    }
-  }
-  const stdout = sink(ctx.stdout)
-  const stderr = sink(ctx.stderr)
-  pyodide.setStdin({
-    isatty: false,
-    read(buffer) {
-      const count = Math.min(buffer.length, input.length - offset)
-      buffer.set(input.subarray(offset, offset + count))
-      offset += count
-      return count
-    },
-  })
-  pyodide.setStdout(stdout)
-  pyodide.setStderr(stderr)
-  pyodide.setInterruptBuffer({
-    get 0() {
-      if (!stopped() || Date.now() - signalled < 50) return 0
-      signalled = Date.now()
-      return 2
-    },
-    set 0(_value: number) {},
-  })
-
-  const env = { ...ctx.env, PWD: ctx.cwd, PYTHONDONTWRITEBYTECODE: '1' }
-  const path0 =
-    mode.kind === 'file' ? parentOf(mode.filename) : mode.kind === 'module' ? ctx.cwd : ''
-  const task = python.start(
-    JSON.stringify({
-      kind: mode.kind,
-      target: mode.target,
-      argv: mode.argv,
-      filename: mode.filename,
-      cwd: ctx.cwd,
-      env,
-      path0,
-    }),
-  )
-  const cancel = () => {
-    quiet = true
-    try {
-      python.cancel()
-    } catch {}
-    quiet = false
-  }
-  const timer = setTimeout(cancel, Math.max(0, deadline - Date.now()))
-  ctx.signal.addEventListener('abort', cancel, { once: true })
-  let status: number
+  let result
   try {
-    status = Number(await task)
-  } finally {
-    clearTimeout(timer)
-    ctx.signal.removeEventListener('abort', cancel)
-    pyodide.setInterruptBuffer(undefined)
-    stdout.flush()
-    stderr.flush()
+    result = await sci.run(
+      {
+        argv: ctx.args,
+        cwd: ctx.cwd,
+        env: { ...ctx.env, PWD: ctx.cwd },
+        files: [...files],
+        memory: ctx.limits.maxMemoryBytes,
+        stdin: encode(run.stdin),
+        timeMs: ctx.limits.timeoutMs,
+      },
+      ctx.signal,
+    )
+  } catch (error) {
+    if (ctx.signal.aborted) return 130
+    ctx.stderr.write(
+      'python3: the scientific interpreter failed: ' +
+        (error instanceof Error ? error.message : String(error)) +
+        '\n',
+    )
+    return 1
   }
-
-  if (lazy) await apply(ctx.fs, lazy.finish())
-  else await writeBack(ctx.fs, snap, collect(pyodide.FS, unique))
-  if (failure !== undefined) throw failure
-  if (status >= 0) return status
-  if (ctx.signal.aborted && Date.now() <= deadline) throw new CommandError('interrupted', 130)
-  throw new CommandError('timed out after ' + ctx.limits.timeoutMs + ' ms', 124)
+  for (const path of [...(result.deleted ?? [])].sort((a, b) => b.length - a.length))
+    await erase(ctx.fs, path).catch((error) => {
+      if (!(error instanceof FsError)) throw error
+    })
+  for (const [path, data] of result.files) {
+    await breathe()
+    await mkdirs(ctx.fs, parentOf(path))
+    await ctx.fs.write(path, data)
+  }
+  ctx.stdout.write(result.stdout)
+  ctx.stderr.write(result.stderr)
+  return result.status
 }

@@ -1,105 +1,57 @@
-export { preload, pyodideUrl, pyodideVersion } from './internal/commands/python.ts'
-
 export type Options = {
-  batchBytes?: number
-  indexURL?: string
-  load?: () => Promise<Pyodide>
+  unavailable?: string
   maxBytes?: number
-  maxFiles?: number
-  mirror?: string
-  module?: false | WebAssembly.Module
-  remote?: Remote
-  shared?: boolean
+  module?: false | WebAssembly.Module | (() => Promise<WebAssembly.Module>)
+  // python.data, the memory image python.wasm starts from (gzip or not), or a function that loads it once
+  // per isolate; by default Node reads nanocode-ts/python.data beside python.wasm.
+  data?: Data
   cpuMs?: number
   stepsPerMs?: number
-  worker?: boolean
+  // Where scripts that import polars run. python.wasm leaves polars out (it would grow from 29 MB to
+  // 64 MB), so a host that wants it supplies a second interpreter: a script whose source imports one of
+  // sci.modules (polars by default) goes there, and so does one the main interpreter stops with
+  // ModuleNotFoundError for one of them. Without sci such a script fails with an error naming polars.
+  sci?: Sci
 }
 
-export type Pyodide = {
-  FS: PyodideFS
-  globals: { get(name: string): unknown }
-  loadPackage(names: string | string[], options?: Messages): Promise<unknown>
-  loadPackagesFromImports(code: string, options?: Messages): Promise<unknown>
-  runPython(code: string, options?: { globals?: unknown }): unknown
-  setInterruptBuffer(buffer: unknown): void
-  setStderr(options: Stream): void
-  setStdin(options: { read(buffer: Uint8Array): number; isatty?: boolean }): void
-  setStdout(options: Stream): void
+export type Data =
+  | Uint8Array
+  | ArrayBuffer
+  | Promise<Uint8Array | ArrayBuffer>
+  | (() => Uint8Array | ArrayBuffer | Promise<Uint8Array | ArrayBuffer | undefined> | undefined)
+
+type Loads = WebAssembly.Module | (() => Promise<WebAssembly.Module>)
+
+// The polars python.wasm in this process, on the same files as python3 (Node and Vercel: PythonSci.local),
+// or a runner elsewhere that is sent the files the script can read and returns the files it wrote
+// (Cloudflare: a python-sci Worker behind a service binding, PythonSci.remote).
+export type Sci = (
+  | { module: Loads; data: Data; run?: undefined }
+  | { run(request: SciRequest, signal: AbortSignal): Promise<SciResult>; module?: undefined }
+) & {
+  mode?: 'all' | 'imports'
+  modules?: readonly string[]
+  // The most bytes of files a remote run is sent, maxMemoryBytes by default: the files named on the
+  // command line or quoted as absolute paths in the code, then the working directory, then site-packages.
+  sendBytes?: number
 }
 
-export type PyodideFS = {
-  analyzePath(path: string): { exists: boolean }
-  chdir(path: string): void
-  isDir(mode: number): boolean
-  isFile(mode: number): boolean
-  mkdirTree(path: string): void
-  readdir(path: string): string[]
-  readFile(path: string): Uint8Array
-  rmdir(path: string): void
-  stat(path: string): { mode: number }
-  unlink(path: string): void
-  writeFile(path: string, data: Uint8Array): void
-}
-
-export type Remote = (request: Request, signal: AbortSignal) => Promise<Reply>
-
-export type Reply = {
-  dirs: string[]
-  files: [string, string | Uint8Array | null][]
-  large?: [string, number][]
-  mirror?: string
-  missing?: string[]
-  more?: string[]
-  status: number
-  stderr: string
-  stdout: string
-}
-
-export type Request = {
-  append?: boolean
-  argv: string[]
-  binary?: boolean
+export type SciRequest = {
+  argv: readonly string[]
   cwd: string
-  dirs: string[]
   env: Record<string, string>
-  fetch?: string[]
-  filename: string
-  files: [string, string | Uint8Array][]
-  keep?: string[]
-  kind: 'code' | 'stdin' | 'file' | 'module' | 'pip' | 'version'
-  listing?: [string, string][]
-  mirror?: string
-  name: string
-  range?: [number, number]
-  roots: string[]
-  stamps?: [string, string][]
-  stdin: string
-  sync?: boolean
-  target: string
-  timeoutMs: number
+  files: [path: string, bytes: Uint8Array][]
+  memory: number
+  stdin: Uint8Array
+  timeMs: number
 }
 
-type Messages = {
-  messageCallback?: (message: string) => void
-  errorCallback?: (message: string) => void
-}
-
-type Stream = { write(buffer: Uint8Array): number; isatty?: boolean }
-
-const shipped: readonly (readonly [string, RegExp])[] = [
-  ['matplotlib', /\b(matplotlib|pyplot|plt|chart|charts|plot|plots|graph)\b/],
-  ['networkx', /\bnetworkx\b/],
-  ['numpy', /\b(numpy|np)\b/],
-  ['pandas', /\b(pandas|dataframe|pd)\b/],
-  ['pillow', /\b(pillow|pil)\b/],
-  ['scikit-learn', /\b(scikit-learn|sklearn)\b/],
-  ['scipy', /\bscipy\b/],
-  ['sympy', /\bsympy\b/],
-]
-
-export function hint(text: string): readonly string[] | undefined {
-  const lower = text.toLowerCase()
-  const named = shipped.filter((entry) => entry[0] !== 'matplotlib' && entry[1].test(lower))
-  if (!named.length && !/\b(python3?|pip3?|pyodide|py)\b|\.py\b/.test(lower)) return undefined
-  return shipped.filter((entry) => entry[1].test(lower)).map((entry) => entry[0])
+export type SciResult = {
+  kind: string
+  status: number
+  stdout: string
+  stderr: string
+  // The files the run created or changed, and the paths it deleted, which python3 applies to the workspace.
+  files: [path: string, bytes: Uint8Array][]
+  deleted?: string[]
 }

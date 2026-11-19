@@ -19,6 +19,7 @@ import * as Wasm from './Wasm.ts'
 import * as Bash from '../bash/Bash.ts'
 import type * as FileSystem from '../bash/FileSystem.ts'
 import * as GitHub from '../bash/GitHub.ts'
+import type * as Python from '../bash/Python.ts'
 import * as Sources from '../bash/Sources.ts'
 import * as SqlFileSystem from '../bash/SqlFileSystem.ts'
 import * as Files from '../internal/Files.ts'
@@ -219,7 +220,7 @@ export function create(options: create.Options = {}): Harness {
       )
     const wallet = session.payer === 'wallet' ? options.wallet?.(ctx.runId) : undefined
     if (session.payer === 'wallet' && !wallet)
-      throw new Error('this deployment has no Tempo Wallet to pay for models')
+      throw new Error('this deployment has no Tempo account to pay for models')
     const configuredFetch = options.sessionFetch?.(ctx.runId) ?? options.fetch
     const githubToken = options.github?.token
     const cellFetch = GitHub.wrap(Egress.guard(configuredFetch), {
@@ -241,7 +242,7 @@ export function create(options: create.Options = {}): Harness {
         : await Bash.create({
             fs: files,
             cwd: options.workspace?.cwd ?? '/workspace',
-            python: { mirror: ctx.runId },
+            python: options.workspace?.python ?? {},
             ...(options.workspace?.files ? { files: options.workspace.files } : {}),
             ...(options.workspace?.github ? { github: options.workspace.github } : {}),
             ...(options.workspace?.psh ? { psh: options.workspace.psh } : {}),
@@ -252,6 +253,7 @@ export function create(options: create.Options = {}): Harness {
       options.mcp?.fetch?.(ctx.runId) ??
       ((input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init))
     const stop = () => void runtime.dispose().catch(() => undefined)
+    let held: hold.ReturnType | undefined
     ctx.signal.addEventListener('abort', stop, { once: true })
     try {
       try {
@@ -297,7 +299,9 @@ export function create(options: create.Options = {}): Harness {
             ...(options.mcp?.store || options.mcp?.failureMs !== undefined
               ? {
                   mcp: {
-                    ...(options.mcp.failureMs !== undefined ? { failureMs: options.mcp.failureMs } : {}),
+                    ...(options.mcp.failureMs !== undefined
+                      ? { failureMs: options.mcp.failureMs }
+                      : {}),
                     ...(options.mcp.store ? { store: options.mcp.store } : {}),
                   },
                 }
@@ -360,6 +364,7 @@ export function create(options: create.Options = {}): Harness {
       let applied: Contracts.Thinking | undefined
       const placed = new Set<string>()
       let read = ctx.pending().length > 0
+      held = hold(ctx)
       for (;;) {
         if (read) read = false
         else await ctx.refresh()
@@ -384,6 +389,7 @@ export function create(options: create.Options = {}): Harness {
         const next = (await runtime.pending(scope))[0]
         if (!next) {
           if (await runtime.settle()) return
+          await held.begin()
           await changed(runtime, ctx.signal)
           continue
         }
@@ -392,6 +398,7 @@ export function create(options: create.Options = {}): Harness {
           await runtime.setThinking(wanted)
           applied = wanted
         }
+        await held.begin()
         const driving = runtime.drive(next.report.request_id)
         const steering = steer(
           ctx,
@@ -421,6 +428,7 @@ export function create(options: create.Options = {}): Harness {
       throw error
     } finally {
       ctx.signal.removeEventListener('abort', stop)
+      await held?.end()
       await executor?.dispose().catch(() => undefined)
       await runtime.dispose().catch(() => undefined)
     }
@@ -595,6 +603,8 @@ export declare namespace create {
           files?: Record<string, string>
           github?: GitHub.Options
           psh?: WebAssembly.Module | Promise<WebAssembly.Module>
+          // python3's options: sci: PythonSci.local() runs scripts that import polars in this process.
+          python?: Python.Options
         }
     workspaceTools?: Contracts.AgentConfiguration['workspace_tools']
     webSearch?: false
@@ -920,6 +930,46 @@ async function callTool(
       )
     ctx.halt?.(error)
     throw error
+  }
+}
+
+function hold(ctx: DriveContext): hold.ReturnType {
+  let begun: Promise<void> | undefined
+  let effect: Promise<void> | undefined
+  let release = () => {}
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+
+  return {
+    begin() {
+      begun ??= new Promise<void>((resolve, reject) => {
+        effect = ctx.effect(
+          `nanocode.hold:${crypto.randomUUID()}`,
+          { name: 'nanocode.hold', replay: 'never', input: {} },
+          (io) => {
+            resolve()
+            return new Promise<void>((done) => {
+              void released.then(done)
+              io.signal.addEventListener('abort', () => done(), { once: true })
+            })
+          },
+        )
+        effect.catch(reject)
+      })
+      return begun
+    },
+    async end() {
+      release()
+      await effect?.catch((error: unknown) => ctx.halt?.(error))
+    },
+  }
+}
+
+declare namespace hold {
+  type ReturnType = {
+    begin(): Promise<void>
+    end(): Promise<void>
   }
 }
 

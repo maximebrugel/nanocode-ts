@@ -80,6 +80,8 @@ struct CodexOptions {
     min_wait_ms: Option<std::num::NonZeroU64>,
     #[serde(default)]
     verification_requested: bool,
+    #[serde(default)]
+    single_verification: bool,
 }
 
 impl CodexOptions {
@@ -110,11 +112,13 @@ struct FinishLevers {
     low_effort_rounds: bool,
     persist_finish: bool,
     persistence_nudge: bool,
+    omit_media_on_empty_cut: bool,
     result_effort: Option<nanocode::claude::Effort>,
     skip_finish_check: bool,
     stop_at_target: bool,
     yield_floor: Option<Duration>,
     yield_share: Option<std::num::NonZeroU8>,
+    stall_nudge: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -278,6 +282,8 @@ struct Configuration {
     #[serde(default)]
     persistence_nudge: bool,
     #[serde(default)]
+    omit_media_on_empty_cut: bool,
+    #[serde(default)]
     clearing_cache_floors: bool,
     #[serde(default)]
     finish_ambiguity: bool,
@@ -297,6 +303,8 @@ struct Configuration {
     stop_at_target: bool,
     #[serde(default)]
     yield_floor_ms: Option<std::num::NonZeroU64>,
+    #[serde(default)]
+    stall_nudge_ms: Option<std::num::NonZeroU64>,
     #[serde(default)]
     yield_share: Option<std::num::NonZeroU8>,
     #[serde(default)]
@@ -748,6 +756,8 @@ enum Command {
     Catalog {
         frame: String,
         max_frame_bytes: usize,
+        #[serde(default)]
+        definitions: bool,
     },
     Admit {
         request_id: String,
@@ -1113,6 +1123,7 @@ fn claude_harness(
             .low_effort_rounds(levers.low_effort_rounds)
             .persist_finish(levers.persist_finish)
             .persistence_nudge(levers.persistence_nudge)
+            .omit_media_on_empty_cut(levers.omit_media_on_empty_cut)
             .skip_finish_check(levers.skip_finish_check)
             .stop_at_target(levers.stop_at_target);
         if let Some(min_left) = levers.late_finish_check {
@@ -1132,6 +1143,9 @@ fn claude_harness(
         }
         if let Some(percent) = levers.yield_share {
             claude = claude.yield_share(percent);
+        }
+        if let Some(every) = levers.stall_nudge {
+            claude = claude.stall_nudge(every);
         }
         if let Some(escalation) = &escalation {
             claude = claude.escalate(escalation.clone());
@@ -1236,7 +1250,8 @@ fn codex_harness(
         let codex = codex
             .persist_finish(persist_finish)
             .lean_custom_tool_arguments(options.lean_tool_arguments)
-            .verification_requested(options.verification_requested);
+            .verification_requested(options.verification_requested)
+            .single_verification(options.single_verification);
         let custom = !Model::ALL.contains(&codex.selected_model());
         let codex = match options.max_output_tokens {
             Some(tokens) if custom => codex.max_output_tokens(tokens.get()),
@@ -1292,7 +1307,8 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
     })?;
     let mut environment = config.environment.take();
     let claude_direct = matches!(config.claude_orchestration, ClaudeOrchestration::Direct);
-    if placement {
+    let single_hand = config.headless && config.attached_hands.len() <= 1;
+    if placement && !single_hand {
         let environment = environment.get_or_insert_with(Environment::default);
         if !claude_direct {
             environment.project_instructions =
@@ -1304,6 +1320,7 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
     }
     let environment = resolve(environment)?;
     let (claude, codex) = config.endpoints().map_err(configuration)?;
+    let claude_only = claude.is_some() && codex.is_none();
     let hedging = hedging(&config.hedge)?;
     let claude_search_tokens = claude.as_ref().map(|endpoint| endpoint.max_tokens);
     let escalation = config
@@ -1339,6 +1356,7 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
                 low_effort_rounds: config.low_effort_rounds,
                 persist_finish: config.persist_finish,
                 persistence_nudge: config.persistence_nudge,
+                omit_media_on_empty_cut: config.omit_media_on_empty_cut,
                 result_effort: config.result_effort,
                 skip_finish_check: config.skip_finish_check,
                 stop_at_target: config.stop_at_target,
@@ -1346,6 +1364,9 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
                     .yield_floor_ms
                     .map(|ms| Duration::from_millis(ms.get())),
                 yield_share: config.yield_share,
+                stall_nudge: config
+                    .stall_nudge_ms
+                    .map(|ms| Duration::from_millis(ms.get())),
             },
             escalation,
             config.tool_result_clearing,
@@ -1429,8 +1450,9 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
         config.hand_tools.unwrap_or_default(),
         matches!(config.codex_orchestration, CodexOrchestration::Jobs),
         claude_direct,
+        config.headless,
     ));
-    let hands = placement.then(|| Arc::new(executors.tool()) as Arc<dyn Tool>);
+    let hands = (placement && !single_hand).then(|| Arc::new(executors.tool()) as Arc<dyn Tool>);
     let mut shared: Vec<Arc<dyn Tool>> = Vec::new();
     let mcp = mcp::tools(config.mcp_servers)
         .await
@@ -1605,7 +1627,7 @@ async fn open(mut config: Configuration) -> Result<Session, Opening> {
             ),
         );
     }
-    if config.subagents == Some(false) {
+    if !config.subagents.unwrap_or(!(single_hand && claude_only)) {
         builder = builder.without_subagents();
     } else if config.remote_children {
         builder = builder.child_host(children::HostChildren);
@@ -2486,7 +2508,8 @@ fn execute(command: Command) -> Executed {
         Command::Catalog {
             frame,
             max_frame_bytes,
-        } => executed(async move { remote::catalog(&frame, max_frame_bytes) }),
+            definitions,
+        } => executed(async move { remote::catalog(&frame, max_frame_bytes, definitions) }),
         Command::Admit {
             request_id,
             recorded,

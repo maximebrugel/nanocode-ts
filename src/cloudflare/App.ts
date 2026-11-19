@@ -7,6 +7,7 @@ import type * as FileSystem from '../bash/FileSystem.ts'
 import * as GitHub from '../bash/GitHub.ts'
 import * as Mount from '../bash/Mount.ts'
 import type * as Python from '../bash/Python.ts'
+import * as PythonSci from '../bash/PythonSci.ts'
 import * as SqlFileSystem from '../bash/SqlFileSystem.ts'
 import * as Contracts from '../Contracts.ts'
 import * as EventHub from '../EventHub.ts'
@@ -71,6 +72,13 @@ export const claudeOrchestrations: readonly Contracts.ClaudeOrchestration[] = [
 
 export const refusalFallbacks: readonly Contracts.RefusalFallback[] = ['return_once', 'session']
 
+export const defaultProvider: Contracts.ModelProvider = 'claude'
+
+const instructionsError = 'project_instructions must be a string of at most 32768 characters'
+function instructionsText(value: unknown): boolean {
+  return typeof value === 'string' && value.length <= 32_768
+}
+
 export const finishLevers = [
   'brief_final',
   'brief_finish',
@@ -80,6 +88,7 @@ export const finishLevers = [
   'fold_finish',
   'lean_cells',
   'low_effort_rounds',
+  'omit_media_on_empty_cut',
   'persist_finish',
   'persistence_nudge',
   'skip_finish_check',
@@ -92,6 +101,7 @@ export const codexSwitches = [
   'lean_tool_arguments',
   'lenient_patches',
   'verification_requested',
+  'single_verification',
 ] as const
 
 export const codexLimits = ['context_window', 'max_output_tokens', 'min_wait_ms'] as const
@@ -125,6 +135,7 @@ export type SessionDescriptor = SessionAuthority & {
   model?: string
   thinking?: Contracts.Thinking
   web_search?: boolean
+  project_instructions?: string
   claude_orchestration?: Contracts.ClaudeOrchestration
   codex_orchestration?: Contracts.CodexOrchestration
   deadline?: Contracts.Deadline
@@ -143,6 +154,7 @@ export type SessionDescriptor = SessionAuthority & {
   tool_repair?: boolean
   low_effort_rounds?: boolean
   persist_finish?: boolean
+  omit_media_on_empty_cut?: boolean
   persistence_nudge?: boolean
   result_effort?: Contracts.Effort
   skip_finish_check?: boolean
@@ -151,6 +163,7 @@ export type SessionDescriptor = SessionAuthority & {
   tool_result_clearing?: Contracts.ToolResultClearing
   tool_result_tokens?: number
   yield_floor_ms?: number
+  stall_nudge_ms?: number
   yield_share?: number
   compact_instructions?: boolean
   context_window?: number
@@ -160,6 +173,7 @@ export type SessionDescriptor = SessionAuthority & {
   min_wait_ms?: number
   session_name: string
   verification_requested?: boolean
+  single_verification?: boolean
   subscription: boolean
   codex_subscription?: boolean
   payer?: Contracts.Payer
@@ -220,9 +234,32 @@ export type HostToolCall = {
 const workspaceMemoryBytes = 48 * 1024 * 1024
 
 const workspaceFileBytes = 32 * 1024 * 1024
-const pythonRemoteBytes = 256 * 1024 * 1024
 const pythonStepsPerMs = 42_000
 const pythonCpuMs = 5_000
+
+function sciOption(
+  sci: Python.Sci | { fetch(input: string, init?: RequestInit): Promise<Response> } | undefined,
+): { sci?: Python.Sci } {
+  if (!sci) return {}
+  return { sci: 'run' in sci || 'module' in sci ? sci : PythonSci.remote(sci) }
+}
+
+// Where the default python.data loader finds the image in the Worker's static assets (env.ASSETS).
+const pythonDataPath = '/nanocode-ts/python.data'
+
+const loadPython = (): Promise<WebAssembly.Module> =>
+  import('nanocode-ts/python.wasm').then(
+    (loaded: { default: WebAssembly.Module }) => loaded.default,
+  )
+
+async function assetData(env: unknown): Promise<ArrayBuffer | undefined> {
+  const assets = (env as { ASSETS?: { fetch(input: string): Promise<Response> } } | undefined)
+    ?.ASSETS
+  if (!assets) return undefined
+  const response = await assets.fetch('https://assets.invalid' + pythonDataPath)
+  if (!response.ok) throw new Error('ASSETS answered ' + response.status + ' for ' + pythonDataPath)
+  return response.arrayBuffer()
+}
 
 const workersAiModel = (model: string | undefined): boolean =>
   model === 'glm-5.3' || (model?.startsWith('@cf/') ?? false)
@@ -440,6 +477,55 @@ type Watch = { watch: string; cursor: number; live?: boolean }
 type Watcher = { state: Watch; scope: string; descriptor: SessionDescriptor }
 type HandExecutor = Remote.Executor<WebSocket>
 type Admission = Omit<Parameters<AgentRuntime.AgentRuntime['submit']>[1], 'buffered'>
+const perRequestSocketHeaders = new Set(['thread-id', 'x-client-request-id', 'x-codex-turn-state'])
+
+function spareKey(request: Contracts.SpareSocket['request']): string {
+  return JSON.stringify([
+    request.provider,
+    request.origin,
+    request.subagent,
+    request.headers
+      .map(([name, value]) => [name.toLowerCase(), value])
+      .filter(([name]) => !perRequestSocketHeaders.has(name!))
+      .sort(([a], [b]) => (a! < b! ? -1 : a! > b! ? 1 : 0)),
+  ])
+}
+
+function socketOpen(socket: Contracts.MessageSocket): boolean {
+  const state = (socket as { readyState?: number }).readyState
+  return state === undefined || state === 1
+}
+
+function closeQuietly(socket: Contracts.MessageSocket): void {
+  try {
+    socket.close(1000, 'closed')
+  } catch {}
+}
+
+function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', abort)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', abort)
+        reject(error)
+      },
+    )
+  })
+}
+
+type ParkedHandshake = {
+  key: string
+  settled: Promise<Contracts.SpareSocket | undefined>
+  claimed: boolean
+}
+
 type Opened = {
   opening: string
   runtime: Promise<AgentRuntime.AgentRuntime>
@@ -451,6 +537,11 @@ type Lifecycle = {
   prewarmed?: { session: string; provider: string; model: string; executor: string }
 }
 type Connection = { executor: HandExecutor; hand: string; runtime: string | null }
+type HandCheck = {
+  allowed: boolean | Promise<boolean>
+  descriptor: SessionDescriptor
+  expires: number
+}
 const ownerScope = 'owner'
 const unfinishedStatuses = new Set(['queued', 'running'])
 const parentSubmit = 'parent__submit_result'
@@ -618,14 +709,24 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
     >()
     private readonly connections = new Map<string, Connection>()
     private readonly handSockets = new Map<WebSocket, HandExecutor>()
+    private readonly heldCatalogs = new Map<string, { definitions: string; holders: number }>()
     private readonly handAuthority = new Map<string, SessionDescriptor>()
+    private readonly handChecks = new Map<string, HandCheck>()
     private readonly rechecks = new Set<WebSocket>()
     private readonly handFrames = new Map<WebSocket, Promise<void>>()
     private readonly handReplies = new Map<string, Set<(frame: string) => void>>()
     private handRequestsPruned = 0
+    private readonly handRequested = new Map<string, number>()
+    private effectSync?: Promise<void>
     private readonly handUpdates = new Map<string, { bytes: number; frames: string[] }>()
     private linger?: ReturnType<typeof setTimeout>
+    private readonly spares = new Map<
+      string,
+      { key: string; spare: Contracts.SpareSocket; timer: ReturnType<typeof setTimeout> }
+    >()
+    private readonly handshakes = new Map<string, ParkedHandshake>()
     private pumping = false
+    private handReady = false
     private modelAt?: number
     private compiled?: Promise<void>
     private readonly steps = new WeakMap<Request, string[]>()
@@ -665,6 +766,9 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
       direct_starts: 0,
       recoveries: 0,
       runtime_retirements: 0,
+      model_socket_spares: 0,
+      model_socket_reuses: 0,
+      model_socket_adoptions: 0,
       host_tool_calls: 0,
       prompt_cache_primes: 0,
       prompt_cache_prime_failures: 0,
@@ -716,6 +820,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
       this.blobs = Blobs.create(ctx.storage, { partBytes: valueLimit })
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
       this.restoreHands()
+      this.restoreHandRequests()
       this.restoreWatchers()
       this.retryWaiting()
       this.prefetchModelHeads()
@@ -826,6 +931,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
 
     private async serve(request: Request): Promise<Response> {
       const admitted = performance.now()
+      let operation = 'route'
       if (this.deleted) return json({ error: 'session deleted' }, 410)
       try {
         const url = new URL(request.url)
@@ -995,12 +1101,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           return await this.cancel(decodeURIComponent(parts[3]), scope)
         if (parts[2] === 'warm') {
           if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405)
-          const input = (await request.json().catch(() => null)) as {
-            provider?: unknown
-            model?: unknown
-            payer?: unknown
-            web_search?: unknown
-          } | null
+          const input = (await request.json().catch(() => null)) as any
           const provider =
             this.metadata.get(`model_provider:${scope}`) ?? input?.provider ?? 'claude'
           if (provider !== 'claude' && provider !== 'codex')
@@ -1009,10 +1110,24 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           if (webSearch !== undefined && typeof webSearch !== 'boolean')
             return json({ error: 'web_search must be a boolean' }, 400)
           if (webSearch !== undefined) descriptor.web_search = webSearch
+          const project = input?.project_instructions
+          if (project !== undefined && !instructionsText(project))
+            return json({ error: instructionsError }, 400)
+          if (project !== undefined)
+            descriptor.project_instructions = (project as string) || undefined
           const payer = this.metadata.get(`payer:${scope}`) ?? input?.payer
           if (payer !== undefined && !offered.includes(payer as Contracts.Payer))
             return json({ error: `payer must be one of ${offered.join(', ')}` }, 400)
           descriptor.payer = payer as Contracts.Payer | undefined
+          if (input) {
+            const invalid = this.invalidTurn(input)
+            if (invalid) return invalid
+            descriptor.hand = input.hand
+            descriptor.codex_orchestration = input.codex_orchestration
+            descriptor.claude_orchestration = input.claude_orchestration
+            descriptor.subagents = input.subagents
+            this.shapeTurn(descriptor, input)
+          }
           const instance = this.instance(scope)
           void instance.catch(() => {})
           if (this.metadata.get(`model_provider:${scope}`) === undefined)
@@ -1122,149 +1237,8 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           !input.prompt.trim()
         )
           return json({ error: 'request_id and prompt must be nonempty strings' }, 400)
-        if (
-          input.provider !== undefined &&
-          input.provider !== 'claude' &&
-          input.provider !== 'codex'
-        )
-          return json({ error: 'provider must be claude or codex' }, 400)
-        if (input.model !== undefined && (typeof input.model !== 'string' || !input.model))
-          return json({ error: 'model must be a nonempty model ID' }, 400)
-        if (input.thinking !== undefined && !thinkingLevels.includes(input.thinking))
-          return json({ error: `thinking must be one of ${thinkingLevels.join(', ')}` }, 400)
-        if (
-          input.executor !== undefined &&
-          (typeof input.executor !== 'string' || !Executor.idPattern.test(input.executor))
-        )
-          return json({ error: 'invalid executor' }, 400)
-        if (input.hand !== undefined && !handName(input.hand))
-          return json({ error: 'hand must be the name of an attached hand' }, 400)
-        if (input.steer !== undefined && typeof input.steer !== 'boolean')
-          return json({ error: 'steer must be a boolean' }, 400)
-        if (input.web_search !== undefined && typeof input.web_search !== 'boolean')
-          return json({ error: 'web_search must be a boolean' }, 400)
-        if (
-          input.claude_orchestration !== undefined &&
-          !claudeOrchestrations.includes(input.claude_orchestration)
-        )
-          return json(
-            { error: `claude_orchestration must be one of ${claudeOrchestrations.join(', ')}` },
-            400,
-          )
-        if (
-          input.codex_orchestration !== undefined &&
-          !codexOrchestrations.includes(input.codex_orchestration)
-        )
-          return json(
-            { error: `codex_orchestration must be one of ${codexOrchestrations.join(', ')}` },
-            400,
-          )
-        if (input.subagents !== undefined && typeof input.subagents !== 'boolean')
-          return json({ error: 'subagents must be a boolean' }, 400)
-        if (
-          input.deadline !== undefined &&
-          !(
-            Number.isSafeInteger(input.deadline?.at_ms) &&
-            Number.isSafeInteger(input.deadline?.limit_ms) &&
-            input.deadline.at_ms > 0 &&
-            input.deadline.limit_ms > 0 &&
-            Object.keys(input.deadline).length === 2
-          )
-        )
-          return json(
-            { error: 'deadline must be { at_ms, limit_ms } with positive whole milliseconds' },
-            400,
-          )
-        if (
-          input.refusal_fallback !== undefined &&
-          !refusalFallbacks.includes(input.refusal_fallback)
-        )
-          return json(
-            { error: `refusal_fallback must be one of ${refusalFallbacks.join(', ')}` },
-            400,
-          )
-        for (const lever of [...finishLevers, ...codexSwitches])
-          if (input[lever] !== undefined && typeof input[lever] !== 'boolean')
-            return json({ error: `${lever} must be a boolean` }, 400)
-        if (
-          input.tool_result_tokens !== undefined &&
-          !(Number.isSafeInteger(input.tool_result_tokens) && input.tool_result_tokens > 0)
-        )
-          return json({ error: 'tool_result_tokens must be a positive whole number' }, 400)
-        if (
-          input.tool_result_clearing !== undefined &&
-          !(
-            typeof input.tool_result_clearing === 'object' &&
-            input.tool_result_clearing !== null &&
-            Object.keys(input.tool_result_clearing).every(
-              (key) => key === 'at_least_tokens' || key === 'keep',
-            ) &&
-            [input.tool_result_clearing.at_least_tokens, input.tool_result_clearing.keep].every(
-              (value) => Number.isSafeInteger(value) && value >= 0,
-            )
-          )
-        )
-          return json(
-            { error: 'tool_result_clearing must be { at_least_tokens, keep } of whole numbers' },
-            400,
-          )
-        if (input.result_effort !== undefined && !resultEfforts.includes(input.result_effort))
-          return json({ error: `result_effort must be one of ${resultEfforts.join(', ')}` }, 400)
-        for (const limit of [
-          'finish_check_min_requests',
-          'finish_retries',
-          'late_finish_check_ms',
-          'yield_floor_ms',
-          ...codexLimits,
-        ] as const)
-          if (
-            input[limit] !== undefined &&
-            !(Number.isSafeInteger(input[limit]) && input[limit] > 0)
-          )
-            return json({ error: `${limit} must be a positive whole number` }, 400)
-        if (
-          input.yield_share !== undefined &&
-          !(
-            Number.isSafeInteger(input.yield_share) &&
-            input.yield_share > 0 &&
-            input.yield_share <= 100
-          )
-        )
-          return json({ error: 'yield_share must be a whole percent from 1 to 100' }, 400)
-        if (
-          input.escalate !== undefined &&
-          !(
-            typeof input.escalate?.model === 'string' &&
-            input.escalate.model.length > 0 &&
-            (input.escalate.context_tokens !== undefined ||
-              input.escalate.tool_errors !== undefined) &&
-            [input.escalate.context_tokens, input.escalate.tool_errors].every(
-              (value: unknown) =>
-                value === undefined || (Number.isSafeInteger(value) && (value as number) > 0),
-            ) &&
-            Object.keys(input.escalate).every((key) =>
-              ['context_tokens', 'model', 'tool_errors'].includes(key),
-            )
-          )
-        )
-          return json(
-            {
-              error:
-                'escalate must be { model, context_tokens?, tool_errors? } with a model and at least one positive whole trigger',
-            },
-            400,
-          )
-        if (input.subagents === true && options.subagents === false)
-          return json({ error: 'subagents are disabled for this app' }, 400)
-        if (input.payer !== undefined && !offered.includes(input.payer))
-          return json({ error: `payer must be one of ${offered.join(', ')}` }, 400)
-        if (
-          input.images !== undefined &&
-          (!Array.isArray(input.images) ||
-            input.images.length > 8 ||
-            input.images.some((path: unknown) => typeof path !== 'string'))
-        )
-          return json({ error: 'images must be at most 8 workspace paths' }, 400)
+        const invalid = this.invalidTurn(input)
+        if (invalid) return invalid
         if (input.steer) {
           const resident = this.opened(scope)?.resident
           if (
@@ -1341,6 +1315,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           const boundProvider =
             this.metadata.get(providerKey) ?? (initialized ? 'claude' : undefined)
           descriptor.provider = input.provider ?? boundProvider ?? 'claude'
+          operation = 'admit'
           const admitter = await this.instance(scope)
           lap('instance')
           const rejected = await admitter.admit(
@@ -1397,22 +1372,11 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           )
             return json({ error: 'session subagents is immutable; create a new session' }, 409)
           descriptor.subagents = input.subagents ?? sessionSubagents
-          descriptor.deadline = input.deadline
-          descriptor.escalate = input.escalate
-          descriptor.tool_result_clearing = input.tool_result_clearing
-          descriptor.tool_result_tokens = input.tool_result_tokens
-          descriptor.finish_check_min_requests = input.finish_check_min_requests
-          descriptor.finish_retries = input.finish_retries
-          descriptor.late_finish_check_ms = input.late_finish_check_ms
-          descriptor.result_effort = input.result_effort
-          descriptor.yield_floor_ms = input.yield_floor_ms
-          descriptor.yield_share = input.yield_share
-          descriptor.refusal_fallback = input.refusal_fallback
-          for (const lever of finishLevers) descriptor[lever] = input[lever]
-          for (const name of codexSwitches) descriptor[name] = input[name]
-          for (const name of codexLimits) descriptor[name] = input[name]
+          this.shapeTurn(descriptor, input)
           descriptor.thinking = input.thinking
           descriptor.web_search = input.web_search
+          descriptor.project_instructions = input.project_instructions || undefined
+          operation = 'subscribe'
           await subscribing
           lap('subscribe')
           if (descriptor.provider === 'codex')
@@ -1436,6 +1400,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           policy(this.env.RECOVERY_DELAY_MS, 'RECOVERY_DELAY_MS')
           const current = this.metadata.get('authority')
           if (current && current !== identity) throw new Error('session authority mismatch')
+          operation = 'images'
           const images =
             options.workspace === false ||
             (descriptor.provider === 'codex' && workersAiModel(descriptor.model))
@@ -1458,6 +1423,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
               : {}),
             metadata: descriptor,
           }
+          operation = 'submit'
           const admitting = await this.instance(scope)
           submitted = await admitting.submit(
             scope,
@@ -1479,6 +1445,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
               409,
             )
           if (submitted.submitted === 'accepted') {
+            operation = 'bind'
             this.metadata.transaction(() => {
               this.metadata.insert('authority', identity)
               this.metadata.insert(providerKey, descriptor.provider!)
@@ -1522,6 +1489,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           scope === ownerScope &&
           descriptor.hand === undefined &&
           this.resident(scope, descriptor)
+        operation = 'dispatch'
         if (direct) await this.dispatchFirst()
         lap('dispatch')
         const committing = accepted ? this.turnTimings.get(input.request_id) : undefined
@@ -1591,6 +1559,12 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
         if (error instanceof URIError) return json({ error: 'invalid request encoding' }, 400)
         if (error instanceof Error && error.message.includes('SQLITE_TOOBIG'))
           return json({ error: "request exceeds the session's storage limit" }, 413)
+        console.error('Session operation failed', {
+          object_id: this.ctx.id.toString(),
+          method: request.method,
+          operation,
+          error: error instanceof Error ? error.stack ?? error.message : String(error),
+        })
         return json({ error: 'session operation failed' }, 503)
       }
     }
@@ -2056,6 +2030,7 @@ ${input.request_id}`
         }
         const hand = next && !next.cancel_requested ? descriptor.hand : undefined
         if (hand !== undefined && !this.hands.get(scope)?.get(hand)?.ready) {
+          this.ctx.waitUntil(this.preopen(scope, sessionId, descriptor))
           retryAt = await this.unavailable(
             scope,
             next,
@@ -2201,7 +2176,9 @@ ${input.request_id}`
         if (retryAt !== null && (unfinished || background))
           await this.ctx.storage.setAlarm(retryAt ?? Date.now() + delay)
         else if (retryAt === null) await this.ctx.storage.deleteAlarm()
-        if (immediate && unfinished) this.ctx.waitUntil(this.pump(true))
+        const handReady = this.handReady
+        this.handReady = false
+        if ((immediate || handReady) && unfinished) this.ctx.waitUntil(this.pump(true))
       }
     }
 
@@ -2381,7 +2358,13 @@ ${input.request_id}`
         ...(descriptor.yield_floor_ms === undefined
           ? []
           : [{ yield_floor_ms: descriptor.yield_floor_ms }]),
+        ...(descriptor.stall_nudge_ms === undefined
+          ? []
+          : [{ stall_nudge_ms: descriptor.stall_nudge_ms }]),
         ...(descriptor.yield_share === undefined ? [] : [{ yield_share: descriptor.yield_share }]),
+        ...(descriptor.project_instructions === undefined
+          ? []
+          : [{ project_instructions: descriptor.project_instructions }]),
         ...(descriptor.context_window === undefined
           ? []
           : [{ context_window: descriptor.context_window }]),
@@ -2496,10 +2479,12 @@ ${input.request_id}`
           )
         }
         const cellFetch = guarded()
-        const pythonRemote = options.workspace
-          ? options.workspace.python?.(authority, this.env)
-          : undefined
-        const pythonModule = options.workspace ? await options.workspace.pythonModule : undefined
+        // python3 runs on the bundled python.wasm unless the app passes its own module or false.
+        const workspaceOptions = options.workspace || undefined
+        const pythonModule =
+          workspaceOptions?.pythonModule === false
+            ? undefined
+            : ((await workspaceOptions?.pythonModule) ?? loadPython)
         const mcpServers =
           typeof options.mcp?.servers === 'function'
             ? options.mcp.servers(authority, this.env)
@@ -2530,27 +2515,24 @@ ${input.request_id}`
                 github: { archive: false, ...options.workspace?.github },
                 wasm: { interpreter },
                 ...(options.workspace?.psh ? { psh: options.workspace.psh } : {}),
-                ...(pythonRemote || pythonModule
+                ...(pythonModule || workspaceOptions?.pythonUnavailable
                   ? {
                       python: {
-                        ...(pythonModule
-                          ? {
-                              module: pythonModule,
-                              cpuMs:
-                                options.workspace?.pythonCpuMs ??
-                                (this.env.PYTHON_CPU_MS === undefined
-                                  ? pythonCpuMs
-                                  : policy(this.env.PYTHON_CPU_MS, 'PYTHON_CPU_MS')),
-                              stepsPerMs: pythonStepsPerMs,
-                            }
-                          : {}),
-                        ...(pythonRemote
-                          ? {
-                              remote: pythonRemote,
-                              maxBytes: pythonRemoteBytes,
-                              mirror: sessionId + ':' + scope,
-                            }
-                          : {}),
+                        unavailable: workspaceOptions?.pythonUnavailable,
+                        module: pythonModule,
+                        data: () =>
+                          options.workspace && options.workspace.pythonData
+                            ? options.workspace.pythonData(this.env)
+                            : assetData(this.env),
+                        cpuMs:
+                          options.workspace?.pythonCpuMs ??
+                          (this.env.PYTHON_CPU_MS === undefined
+                            ? pythonCpuMs
+                            : policy(this.env.PYTHON_CPU_MS, 'PYTHON_CPU_MS')),
+                        stepsPerMs: pythonStepsPerMs,
+                        ...sciOption(
+                          options.workspace ? options.workspace.pythonSci?.(this.env) : undefined,
+                        ),
                       },
                     }
                   : {}),
@@ -2664,6 +2646,9 @@ ${input.request_id}`
               ...(descriptor.yield_floor_ms === undefined
                 ? {}
                 : { yield_floor_ms: descriptor.yield_floor_ms }),
+              ...(descriptor.stall_nudge_ms === undefined
+                ? {}
+                : { stall_nudge_ms: descriptor.stall_nudge_ms }),
               ...(descriptor.yield_share === undefined
                 ? {}
                 : { yield_share: descriptor.yield_share }),
@@ -2716,6 +2701,9 @@ ${input.request_id}`
             },
             {
               ...(shell ? { workspace: shell.workspace() } : {}),
+              ...(descriptor.project_instructions && !child
+                ? { instructions: descriptor.project_instructions }
+                : {}),
               ...(mcpStore ? { mcp: { store: mcpStore } } : {}),
               fetch: (input, init, subagent) =>
                 subagent ? guarded(subagent)(input, init) : cellFetch(input, init),
@@ -2998,9 +2986,20 @@ ${input.request_id}`
                 open: async (request, signal, timing) => {
                   if (this.dispatchBlocked(scope)) throw new Error('request authority stopped')
                   this.dispatched(scope)
+                  const spare =
+                    this.takeSpare(scope, request) ?? (await this.adopt(scope, request, signal))
+                  if (spare) {
+                    this.dispatching?.()
+                    return {
+                      status: spare.status,
+                      headers: spare.headers,
+                      socket: spare.socket,
+                      ...(spare.idle_ms === undefined ? {} : { idle_ms: spare.idle_ms }),
+                      text: async () => '',
+                    }
+                  }
                   const handshake = egress(this.env).fetch(
                     new Request('https://egress.internal/socket', {
-                      signal,
                       headers: {
                         upgrade: 'websocket',
                         'x-nanocode-socket': headerJson({
@@ -3017,7 +3016,13 @@ ${input.request_id}`
                     }),
                   )
                   this.dispatching?.()
-                  const response = await handshake
+                  let response: Response
+                  try {
+                    response = await raced(handshake, signal)
+                  } catch (error) {
+                    if (signal.aborted) this.park(scope, request, handshake)
+                    throw error
+                  }
                   this.diagnostic(
                     scope,
                     response.headers.get('x-nanocode-model-diagnostic'),
@@ -3038,6 +3043,7 @@ ${input.request_id}`
                   this.dispatching?.()
                   return this.socketEffect(scope)
                 },
+                release: (spare) => this.keepSpare(scope, spare),
               },
             },
           )
@@ -3097,13 +3103,29 @@ ${input.request_id}`
         return json({ error: 'invalid hand' }, 400)
       if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket')
         return json({ error: 'hands attach over WebSocket' }, 426)
-      const accepted = Remote.bearerAccepted(request)
+      const accepted: Record<string, string> = Remote.bearerAccepted(request)
+      const offered = request.headers.get(Remote.catalogHeader) ?? undefined
+      const held = offered === undefined ? undefined : this.heldCatalogs.get(offered)
+      if (held) accepted[Remote.catalogHeader] = offered!
       const [client, server] = Object.values(new WebSocketPair())
       this.ctx.acceptWebSocket(server, [handTag])
       server.send(Remote.handAccepted)
-      const executor = Remote.accept(server, this.handLimits())
+      const executor = Remote.accept(
+        server,
+        this.handLimits(),
+        held && { catalog_hash: offered!, definitions: held.definitions },
+      )
       this.handSockets.set(server, executor)
-      this.ctx.waitUntil(this.registerHand(scope, requested, executor, descriptor))
+      this.ctx.waitUntil(
+        this.registerHand(
+          scope,
+          requested,
+          executor,
+          descriptor,
+          offered,
+          held && this.holdCatalog(offered!),
+        ),
+      )
       return new Response(null, { status: 101, webSocket: client, headers: accepted })
     }
 
@@ -3115,27 +3137,53 @@ ${input.request_id}`
       }
     }
 
+    private holdCatalog(catalog_hash: string, definitions?: string): (() => void) | undefined {
+      let held = this.heldCatalogs.get(catalog_hash)
+      if (!held) {
+        if (definitions === undefined) return
+        this.heldCatalogs.set(catalog_hash, (held = { definitions, holders: 0 }))
+      }
+      const kept = held
+      kept.holders++
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        if (--kept.holders === 0 && this.heldCatalogs.get(catalog_hash) === kept)
+          this.heldCatalogs.delete(catalog_hash)
+      }
+    }
+
     private async registerHand(
       scope: string,
       requested: string | undefined,
       executor: HandExecutor,
       descriptor: SessionDescriptor,
+      offered?: string,
+      release?: () => void,
     ): Promise<void> {
+      void executor.closed.then(() => release?.())
       try {
         await executor.ready()
       } catch {
         this.handSockets.delete(executor.socket)
         return
       }
-      let advertised: { name: string | null; runtime_id: string | null }
+      let advertised: Awaited<ReturnType<AgentRuntime.AgentRuntime['identity']>>
       try {
         advertised = await (
           await this.instance(scope)
-        ).identity(executor.catalog!, this.handLimits().max_frame_bytes)
+        ).identity(
+          executor.catalog!,
+          this.handLimits().max_frame_bytes,
+          offered !== undefined && !release && !this.heldCatalogs.has(offered),
+        )
       } catch (error) {
         this.handSockets.delete(executor.socket)
         return executor.reject(error instanceof Error ? error.message : String(error))
       }
+      if (!release && offered !== undefined && advertised.catalog_hash === offered)
+        release = this.holdCatalog(offered, advertised.definitions)
       const hand = requested ?? advertised.name
       if (!handName(hand)) {
         this.handSockets.delete(executor.socket)
@@ -3156,10 +3204,12 @@ ${input.request_id}`
       ) {
         const earlier = resumed.executor.socket
         if (resumed.executor.rebind(executor.socket, executor.catalog!)) {
+          if (release) void resumed.executor.closed.then(release)
           this.handSockets.delete(earlier)
           this.handSockets.set(executor.socket, resumed.executor)
           executor.socket.serializeAttachment({ connection: resumed.connection })
           this.handAuthority.set(resumed.connection, descriptor)
+          this.handChecks.delete(resumed.connection)
           this.ctx.storage.sql.exec(
             'UPDATE hand_sockets SET descriptor = ? WHERE connection = ?',
             JSON.stringify(descriptor),
@@ -3183,6 +3233,7 @@ ${input.request_id}`
         JSON.stringify(descriptor),
       )
       this.handAuthority.set(connection, descriptor)
+      this.handChecks.delete(connection)
       executor.socket.serializeAttachment({ connection })
       const current = this.hands.get(scope)?.get(hand)?.executor
       const incumbent =
@@ -3214,6 +3265,7 @@ ${input.request_id}`
       const entry = hands.get(hand)
       if (entry?.connection !== connection) return
       entry.ready = true
+      if (this.pumping) this.handReady = true
       if (this.pumping || this.queue === 'empty') return
       const next = (await (await this.instance(scope)).pending(scope))[0]
       if ((next?.metadata as SessionDescriptor | null | undefined)?.hand === hand && !this.pumping)
@@ -3244,6 +3296,7 @@ ${input.request_id}`
       const refused = new Set(request.refused ?? [])
       const now = Date.now()
       const timeout = policy(this.env.REMOTE_TIMEOUT_MS, 'REMOTE_TIMEOUT_MS')
+      const rows: { id: number; session_id: string; call_id: string; deadline: number }[] = []
       for (const [index, frame] of (request.frames ?? []).entries()) {
         if (refused.has(index) || !frame.includes('"type":"request"')) continue
         let parsed: { type?: unknown; id?: unknown; operation?: Record<string, unknown> }
@@ -3263,31 +3316,46 @@ ${input.request_id}`
           typeof context.call_id !== 'string'
         )
           continue
-        this.ctx.storage.sql.exec(
-          'INSERT OR REPLACE INTO hand_requests (hand, runtime, id, scope, session_id, call_id, deadline) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          identity.hand,
-          identity.runtime,
-          parsed.id,
-          scope,
-          context.session_id,
-          context.call_id,
-          now + timeout + requestedYield(operation),
-        )
-        this.handUpdates.set(handRequestKey(identity.hand, identity.runtime, parsed.id), {
-          bytes: 0,
-          frames: [],
+        rows.push({
+          id: parsed.id,
+          session_id: context.session_id,
+          call_id: context.call_id,
+          deadline: now + timeout + requestedYield(operation),
         })
       }
-      if (now - this.handRequestsPruned < timeout) return
+      const prune = now - this.handRequestsPruned >= timeout
+      if (!rows.length && !prune) return
+      this.ctx.storage.transactionSync(() => {
+        for (const row of rows)
+          this.ctx.storage.sql.exec(
+            'INSERT OR REPLACE INTO hand_requests (hand, runtime, id, scope, session_id, call_id, deadline) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            identity.hand,
+            identity.runtime,
+            row.id,
+            scope,
+            row.session_id,
+            row.call_id,
+            row.deadline,
+          )
+        if (!prune) return
+        this.ctx.storage.sql.exec(
+          'DELETE FROM hand_requests WHERE replied < ? OR deadline < ?',
+          now - timeout,
+          now - timeout,
+        )
+        this.ctx.storage.sql.exec(
+          'DELETE FROM hand_updates WHERE NOT EXISTS (SELECT 1 FROM hand_requests WHERE hand_requests.hand = hand_updates.hand AND hand_requests.runtime = hand_updates.runtime AND hand_requests.id = hand_updates.id)',
+        )
+      })
+      for (const row of rows) {
+        const key = handRequestKey(identity.hand, identity.runtime, row.id)
+        this.handRequested.set(key, row.deadline)
+        this.handUpdates.set(key, { bytes: 0, frames: [] })
+      }
+      if (!prune) return
       this.handRequestsPruned = now
-      this.ctx.storage.sql.exec(
-        'DELETE FROM hand_requests WHERE replied < ? OR deadline < ?',
-        now - timeout,
-        now - timeout,
-      )
-      this.ctx.storage.sql.exec(
-        'DELETE FROM hand_updates WHERE NOT EXISTS (SELECT 1 FROM hand_requests WHERE hand_requests.hand = hand_updates.hand AND hand_requests.runtime = hand_updates.runtime AND hand_requests.id = hand_updates.id)',
-      )
+      for (const [key, deadline] of this.handRequested)
+        if (deadline < now - timeout) this.handRequested.delete(key)
     }
 
     private recordHandReply(connection: string | undefined, message: string | ArrayBuffer) {
@@ -3308,24 +3376,27 @@ ${input.request_id}`
       }
       const updates = this.handUpdates.get(key)?.frames ?? []
       this.handUpdates.delete(key)
-      this.ctx.storage.sql.exec(
-        'UPDATE hand_requests SET replied = ?, reply = ? WHERE hand = ? AND runtime = ? AND id = ?',
-        Date.now(),
-        message,
-        identity.hand,
-        identity.runtime,
-        Number(id),
-      )
-      if (message.includes('"delivered":true'))
-        for (const [seq, frame] of updates.entries())
+      if (this.handRequested.delete(key))
+        this.ctx.storage.transactionSync(() => {
           this.ctx.storage.sql.exec(
-            'INSERT OR REPLACE INTO hand_updates (hand, runtime, id, seq, frame) VALUES (?, ?, ?, ?, ?)',
+            'UPDATE hand_requests SET replied = ?, reply = ? WHERE hand = ? AND runtime = ? AND id = ?',
+            Date.now(),
+            message,
             identity.hand,
             identity.runtime,
             Number(id),
-            seq,
-            frame,
           )
+          if (message.includes('"delivered":true'))
+            for (const [seq, frame] of updates.entries())
+              this.ctx.storage.sql.exec(
+                'INSERT OR REPLACE INTO hand_updates (hand, runtime, id, seq, frame) VALUES (?, ?, ?, ?, ?)',
+                identity.hand,
+                identity.runtime,
+                Number(id),
+                seq,
+                frame,
+              )
+        })
       for (const waiter of this.handReplies.get(key) ?? []) waiter(message)
       this.handReplies.delete(key)
     }
@@ -3426,6 +3497,16 @@ ${input.request_id}`
         if (!missing.length) return
         await new Promise((resolve) => setTimeout(resolve, 250))
       }
+    }
+
+    private restoreHandRequests(): void {
+      for (const row of this.ctx.storage.sql
+        .exec('SELECT hand, runtime, id, deadline FROM hand_requests WHERE reply IS NULL')
+        .toArray())
+        this.handRequested.set(
+          handRequestKey(String(row.hand), String(row.runtime), Number(row.id)),
+          Number(row.deadline),
+        )
     }
 
     private restoreHands(): void {
@@ -3772,11 +3853,17 @@ ${input.request_id}`
     private async allowed(descriptor: SessionDescriptor): Promise<boolean> {
       if (!this.current(descriptor)) return false
       if (!options.active) return true
+      let allowed: boolean
       try {
-        return await options.active(descriptor.account_id, descriptor.grant, this.env)
+        allowed = await options.active(descriptor.account_id, descriptor.grant, this.env)
       } catch {
-        return false
+        allowed = false
       }
+      if (!allowed)
+        for (const [connection, check] of this.handChecks)
+          if (check.descriptor.account_id === descriptor.account_id)
+            this.handChecks.delete(connection)
+      return allowed
     }
 
     private handTokenMatches(secret: string): boolean {
@@ -3788,7 +3875,24 @@ ${input.request_id}`
 
     private async handAllowed(connection: string): Promise<boolean> {
       const descriptor = this.handAuthority.get(connection)
-      return !descriptor || (await this.allowed(descriptor))
+      if (!descriptor) return true
+      if (options.activeCacheMs === undefined || !this.current(descriptor))
+        return this.allowed(descriptor)
+      const now = Date.now()
+      const cached = this.handChecks.get(connection)
+      if (cached?.descriptor === descriptor && cached.expires > now) return cached.allowed
+      const check: HandCheck = {
+        allowed: this.allowed(descriptor),
+        descriptor,
+        expires: now + options.activeCacheMs,
+      }
+      this.handChecks.set(connection, check)
+      const allowed = await check.allowed
+      if (this.handChecks.get(connection) === check) {
+        if (allowed) check.allowed = true
+        else this.handChecks.delete(connection)
+      }
+      return allowed
     }
 
     private handFrame(
@@ -3913,10 +4017,20 @@ ${input.request_id}`
       )
     }
 
+    private async preopen(
+      scope: string,
+      sessionId: string,
+      descriptor: SessionDescriptor,
+    ): Promise<void> {
+      try {
+        await (await this.runtime(scope, sessionId, descriptor)).preconnect()
+      } catch {}
+    }
+
     private async warm(scope: string, base: SessionDescriptor): Promise<boolean> {
       const sessionId = this.metadata.get(this.sessionKey(scope))
       if (!sessionId) return false
-      const descriptor = this.bound(scope, base)
+      const descriptor = { ...this.bound(scope, base), hand: base.hand }
       const resident = this.opened(scope)?.runtime
       const busy = this.pumping || !this.queueKnownEmpty() || !!this.metadata.first('background:')
       const current = resident && busy ? await resident.catch(() => undefined) : undefined
@@ -3964,7 +4078,7 @@ ${input.request_id}`
       const descriptor: SessionDescriptor = {
         ...base,
         executor_id: executor || undefined,
-        hand: undefined,
+        hand: base.hand,
         provider,
         model,
         subscription: served(
@@ -4063,6 +4177,166 @@ ${input.request_id}`
       }
     }
 
+    private invalidTurn(input: any): Response | undefined {
+      if (input.provider !== undefined && input.provider !== 'claude' && input.provider !== 'codex')
+        return json({ error: 'provider must be claude or codex' }, 400)
+      if (input.model !== undefined && (typeof input.model !== 'string' || !input.model))
+        return json({ error: 'model must be a nonempty model ID' }, 400)
+      if (input.thinking !== undefined && !thinkingLevels.includes(input.thinking))
+        return json({ error: `thinking must be one of ${thinkingLevels.join(', ')}` }, 400)
+      if (
+        input.executor !== undefined &&
+        (typeof input.executor !== 'string' || !Executor.idPattern.test(input.executor))
+      )
+        return json({ error: 'invalid executor' }, 400)
+      if (input.hand !== undefined && !handName(input.hand))
+        return json({ error: 'hand must be the name of an attached hand' }, 400)
+      if (input.steer !== undefined && typeof input.steer !== 'boolean')
+        return json({ error: 'steer must be a boolean' }, 400)
+      if (input.web_search !== undefined && typeof input.web_search !== 'boolean')
+        return json({ error: 'web_search must be a boolean' }, 400)
+      if (input.project_instructions !== undefined && !instructionsText(input.project_instructions))
+        return json({ error: instructionsError }, 400)
+      if (
+        input.claude_orchestration !== undefined &&
+        !claudeOrchestrations.includes(input.claude_orchestration)
+      )
+        return json(
+          { error: `claude_orchestration must be one of ${claudeOrchestrations.join(', ')}` },
+          400,
+        )
+      if (
+        input.codex_orchestration !== undefined &&
+        !codexOrchestrations.includes(input.codex_orchestration)
+      )
+        return json(
+          { error: `codex_orchestration must be one of ${codexOrchestrations.join(', ')}` },
+          400,
+        )
+      if (input.subagents !== undefined && typeof input.subagents !== 'boolean')
+        return json({ error: 'subagents must be a boolean' }, 400)
+      if (
+        input.deadline !== undefined &&
+        !(
+          Number.isSafeInteger(input.deadline?.at_ms) &&
+          Number.isSafeInteger(input.deadline?.limit_ms) &&
+          input.deadline.at_ms > 0 &&
+          input.deadline.limit_ms > 0 &&
+          Object.keys(input.deadline).length === 2
+        )
+      )
+        return json(
+          { error: 'deadline must be { at_ms, limit_ms } with positive whole milliseconds' },
+          400,
+        )
+      if (
+        input.refusal_fallback !== undefined &&
+        !refusalFallbacks.includes(input.refusal_fallback)
+      )
+        return json(
+          { error: `refusal_fallback must be one of ${refusalFallbacks.join(', ')}` },
+          400,
+        )
+      for (const lever of [...finishLevers, ...codexSwitches])
+        if (input[lever] !== undefined && typeof input[lever] !== 'boolean')
+          return json({ error: `${lever} must be a boolean` }, 400)
+      if (
+        input.tool_result_tokens !== undefined &&
+        !(Number.isSafeInteger(input.tool_result_tokens) && input.tool_result_tokens > 0)
+      )
+        return json({ error: 'tool_result_tokens must be a positive whole number' }, 400)
+      if (
+        input.tool_result_clearing !== undefined &&
+        !(
+          typeof input.tool_result_clearing === 'object' &&
+          input.tool_result_clearing !== null &&
+          Object.keys(input.tool_result_clearing).every(
+            (key) => key === 'at_least_tokens' || key === 'keep',
+          ) &&
+          [input.tool_result_clearing.at_least_tokens, input.tool_result_clearing.keep].every(
+            (value) => Number.isSafeInteger(value) && value >= 0,
+          )
+        )
+      )
+        return json(
+          { error: 'tool_result_clearing must be { at_least_tokens, keep } of whole numbers' },
+          400,
+        )
+      if (input.result_effort !== undefined && !resultEfforts.includes(input.result_effort))
+        return json({ error: `result_effort must be one of ${resultEfforts.join(', ')}` }, 400)
+      for (const limit of [
+        'finish_check_min_requests',
+        'finish_retries',
+        'late_finish_check_ms',
+        'yield_floor_ms',
+        'stall_nudge_ms',
+        ...codexLimits,
+      ] as const)
+        if (input[limit] !== undefined && !(Number.isSafeInteger(input[limit]) && input[limit] > 0))
+          return json({ error: `${limit} must be a positive whole number` }, 400)
+      if (
+        input.yield_share !== undefined &&
+        !(
+          Number.isSafeInteger(input.yield_share) &&
+          input.yield_share > 0 &&
+          input.yield_share <= 100
+        )
+      )
+        return json({ error: 'yield_share must be a whole percent from 1 to 100' }, 400)
+      if (
+        input.escalate !== undefined &&
+        !(
+          typeof input.escalate?.model === 'string' &&
+          input.escalate.model.length > 0 &&
+          (input.escalate.context_tokens !== undefined ||
+            input.escalate.tool_errors !== undefined) &&
+          [input.escalate.context_tokens, input.escalate.tool_errors].every(
+            (value: unknown) =>
+              value === undefined || (Number.isSafeInteger(value) && (value as number) > 0),
+          ) &&
+          Object.keys(input.escalate).every((key) =>
+            ['context_tokens', 'model', 'tool_errors'].includes(key),
+          )
+        )
+      )
+        return json(
+          {
+            error:
+              'escalate must be { model, context_tokens?, tool_errors? } with a model and at least one positive whole trigger',
+          },
+          400,
+        )
+      if (input.subagents === true && options.subagents === false)
+        return json({ error: 'subagents are disabled for this app' }, 400)
+      if (input.payer !== undefined && !offered.includes(input.payer))
+        return json({ error: `payer must be one of ${offered.join(', ')}` }, 400)
+      if (
+        input.images !== undefined &&
+        (!Array.isArray(input.images) ||
+          input.images.length > 8 ||
+          input.images.some((path: unknown) => typeof path !== 'string'))
+      )
+        return json({ error: 'images must be at most 8 workspace paths' }, 400)
+      return undefined
+    }
+
+    private shapeTurn(descriptor: SessionDescriptor, input: any): void {
+      descriptor.deadline = input.deadline
+      descriptor.escalate = input.escalate
+      descriptor.tool_result_clearing = input.tool_result_clearing
+      descriptor.tool_result_tokens = input.tool_result_tokens
+      descriptor.finish_check_min_requests = input.finish_check_min_requests
+      descriptor.finish_retries = input.finish_retries
+      descriptor.late_finish_check_ms = input.late_finish_check_ms
+      descriptor.result_effort = input.result_effort
+      descriptor.yield_floor_ms = input.yield_floor_ms
+      descriptor.stall_nudge_ms = input.stall_nudge_ms
+      descriptor.yield_share = input.yield_share
+      descriptor.refusal_fallback = input.refusal_fallback
+      for (const lever of finishLevers) descriptor[lever] = input[lever]
+      for (const name of codexSwitches) descriptor[name] = input[name]
+      for (const name of codexLimits) descriptor[name] = input[name]
+    }
     private claimPrewarmed(scope: string, descriptor: SessionDescriptor): string | undefined {
       const found = this.lifecycles.get(scope)
       const entry = found?.prewarmed
@@ -4104,7 +4378,115 @@ ${input.request_id}`
       )
     }
 
+    private keepSpare(scope: string, spare: Contracts.SpareSocket): void {
+      this.dropSpare(scope)
+      if (this.deleted || !socketOpen(spare.socket)) {
+        closeQuietly(spare.socket)
+        return
+      }
+      const timer = setTimeout(
+        () => this.dropSpare(scope, spare.socket),
+        duration(this.env.MODEL_SOCKET_LINGER_MS, 'MODEL_SOCKET_LINGER_MS'),
+      )
+      spare.socket.addEventListener('close', () => this.dropSpare(scope, spare.socket))
+      spare.socket.addEventListener('error', () => this.dropSpare(scope, spare.socket))
+      this.spares.set(scope, { key: spareKey(spare.request), spare, timer })
+      this.counts.model_socket_spares++
+    }
+
+    private park(
+      scope: string,
+      request: Contracts.SpareSocket['request'],
+      handshake: Promise<Response>,
+    ): void {
+      const settled = handshake.then(
+        (response): Contracts.SpareSocket | undefined => {
+          const socket = response.status === 101 ? (response.webSocket ?? undefined) : undefined
+          if (!socket) {
+            void response.body?.cancel().catch(() => {})
+            return undefined
+          }
+          socket.accept()
+          return {
+            request,
+            socket,
+            status: response.status,
+            headers: [...response.headers],
+            idle_ms: Number(response.headers.get('x-nanocode-stream-idle-ms')),
+          }
+        },
+        () => undefined,
+      )
+      const parked: ParkedHandshake = { key: spareKey(request), settled, claimed: false }
+      const previous = this.handshakes.get(scope)
+      if (previous) this.discard(previous)
+      this.handshakes.set(scope, parked)
+      void settled.then((spare) => {
+        if (this.handshakes.get(scope) === parked) this.handshakes.delete(scope)
+        if (parked.claimed || !spare) return
+        this.keepSpare(scope, spare)
+      })
+    }
+
+    private discard(parked: ParkedHandshake): void {
+      parked.claimed = true
+      void parked.settled.then((spare) => spare && closeQuietly(spare.socket))
+    }
+
+    private async adopt(
+      scope: string,
+      request: Contracts.SpareSocket['request'],
+      signal: AbortSignal,
+    ): Promise<Contracts.SpareSocket | undefined> {
+      const parked = this.handshakes.get(scope)
+      if (!parked || parked.key !== spareKey(request)) return undefined
+      this.handshakes.delete(scope)
+      parked.claimed = true
+      let spare: Contracts.SpareSocket | undefined
+      try {
+        spare = await raced(parked.settled, signal)
+      } catch (error) {
+        void parked.settled.then((late) => late && this.keepSpare(scope, late))
+        throw error
+      }
+      if (!spare) return undefined
+      if (this.deleted || !socketOpen(spare.socket)) {
+        closeQuietly(spare.socket)
+        return undefined
+      }
+      this.counts.model_socket_reuses++
+      this.counts.model_socket_adoptions++
+      return spare
+    }
+
+    private takeSpare(
+      scope: string,
+      request: Contracts.SpareSocket['request'],
+    ): Contracts.SpareSocket | undefined {
+      const found = this.spares.get(scope)
+      if (!found || found.key !== spareKey(request)) return undefined
+      clearTimeout(found.timer)
+      this.spares.delete(scope)
+      if (!socketOpen(found.spare.socket)) {
+        closeQuietly(found.spare.socket)
+        return undefined
+      }
+      this.counts.model_socket_reuses++
+      return found.spare
+    }
+
+    private dropSpare(scope: string, socket?: Contracts.MessageSocket): void {
+      const found = this.spares.get(scope)
+      if (!found || (socket !== undefined && found.spare.socket !== socket)) return
+      clearTimeout(found.timer)
+      this.spares.delete(scope)
+      closeQuietly(found.spare.socket)
+    }
+
     private releaseConnections(): void {
+      for (const scope of this.spares.keys()) this.dropSpare(scope)
+      for (const parked of this.handshakes.values()) this.discard(parked)
+      this.handshakes.clear()
       for (const [scope, runtime] of this.residents()) {
         if (runtime.remote) this.retire(scope, runtime)
         else runtime.releaseConnections()
@@ -4138,8 +4520,14 @@ ${input.request_id}`
 
     private async durable(scope: string): Promise<void> {
       const started = performance.now()
-      this.counts.effect_syncs++
-      await this.ctx.storage.sync()
+      if (!this.effectSync) {
+        this.counts.effect_syncs++
+        this.effectSync = nextTask().then(() => {
+          this.effectSync = undefined
+          return this.ctx.storage.sync()
+        })
+      }
+      await this.effectSync
       this.scopeTimings(scope).record('effect.sync', performance.now() - started)
     }
 
@@ -4150,6 +4538,7 @@ ${input.request_id}`
       this.ctx.storage.sql.exec('DELETE FROM hand_sockets WHERE connection = ?', connection)
       this.connections.delete(connection)
       this.handAuthority.delete(connection)
+      this.handChecks.delete(connection)
       const hands = this.hands.get(scope)
       if (hands?.get(hand)?.connection === connection) hands.delete(hand)
       void this.opened(scope)
@@ -5037,6 +5426,7 @@ ${input.request_id}`
 export declare namespace create {
   type Options<E extends Env> = {
     active?(account: string, grant: unknown, env: E): Promise<boolean> | boolean
+    activeCacheMs?: number
     authenticate(
       request: Request,
       env: E,
@@ -5104,9 +5494,29 @@ export declare namespace create {
           maxFileBytes?: number
           mounts?(authority: SessionAuthority, env: E): Record<string, FileSystem.FileSystem>
           psh?: WebAssembly.Module | Promise<WebAssembly.Module>
-          python?(authority: SessionAuthority, env: E): Python.Remote | undefined
           pythonCpuMs?: number
-          pythonModule?: WebAssembly.Module | Promise<WebAssembly.Module>
+          pythonUnavailable?: string
+          // python.wasm for the workspace's python3: nanocode-ts/python.wasm by default, false for none.
+          pythonModule?:
+            | WebAssembly.Module
+            | Promise<WebAssembly.Module>
+            | (() => Promise<WebAssembly.Module>)
+            | false
+          // Loads python.data, the image python.wasm starts from, once per isolate. Workers can't hold it in
+          // the bundle, so by default it is fetched from the static assets binding (env.ASSETS) at
+          // /nanocode-ts/python.data: copy node_modules/nanocode-ts/dist/python.data there.
+          pythonData?(
+            env: E,
+          ): Uint8Array | ArrayBuffer | Promise<Uint8Array | ArrayBuffer | undefined>
+          // Where python3 runs scripts that import polars, which python.wasm leaves out: the service
+          // binding of a python-sci Worker (PythonSci.serve, examples/python-sci), or any Python sci
+          // runner. Without it such a script fails with an error naming polars.
+          pythonSci?(
+            env: E,
+          ):
+            | Python.Sci
+            | { fetch(input: string, init?: RequestInit): Promise<Response> }
+            | undefined
         }
     workspaceTools?: Contracts.AgentConfiguration['workspace_tools']
   }

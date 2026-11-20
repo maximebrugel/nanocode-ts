@@ -18,7 +18,8 @@
     "example:board-pool": "node examples/board-pool/index.ts",
     "example:board-agents": "node examples/board-agents/index.ts",
     "example:board-durable-object": "node examples/board-durable-object/index.ts",
-    "check:types": "tsc --noEmit && tsc --noEmit -p tsconfig.vercel.json && tsc --noEmit -p tsconfig.cloudflare.json && tsc --noEmit -p examples/board-agents && tsc --noEmit -p examples/board-durable-object && tsc --noEmit -p examples/board-durable-object/tsconfig.worker.json",
+    "example:board-postgres": "node examples/board-postgres/index.ts",
+    "check:types": "tsc --noEmit && tsc --noEmit -p tsconfig.vercel.json && tsc --noEmit -p tsconfig.cloudflare.json && tsc --noEmit -p examples/board-agents && tsc --noEmit -p examples/board-durable-object && tsc --noEmit -p examples/board-durable-object/tsconfig.worker.json && tsc --noEmit -p examples/board-postgres",
     "prepare": "node scripts/prepare.mjs",
     "test": "node --test 'test/bash-jq.test.ts' 'test/board*.test.ts'"
   },

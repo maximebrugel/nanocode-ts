@@ -29,6 +29,10 @@ npm install https://github.com/nanocodexyz/nanocode-ts/releases/download/build-<
 | `nanocode-ts/bash` | The simulated shell that Code Mode cells run without a machine |
 | `nanocode-ts/machines` | Tempo ID sign-in and MPP payments |
 
+## Board
+
+A shared task list for agents over any SQL host: post tasks with needs and retries, claim them under leases, steer a running task, and drain the board with `Board.pool`. Read [docs/board.md](docs/board.md), and run [examples/board-pool](examples/board-pool/index.ts) with `npm run example:board-pool`.
+
 ## License
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

@@ -1,7 +1,9 @@
 // Browser e2e of pyramid2-web's live feed against a running pyramid2 (web on WEB, API on NODES[0]); run it with
 // test/e2e/pyramid2-web.run.sh, which takes the lease and drives bench/pyramid2-swarm.py beside it. Phases (PHASES):
-// auth, basic, fanout8, fanout32, blip, reload, subagents, soak. Browsers authenticate the live socket through a local
-// relay that adds the bearer header (a browser WebSocket cannot), keyed per session so blip can cut one session off.
+// auth, basic, fanout8, fanout32, blip, reload, subagents, soak. auth tries the web's own same-origin /live (WEB/live)
+// first: a token login (sessionStorage, then ?token=), then the session cookie set on WEB's origin. The first mode
+// that syncs (LIVE=token|query|cookie|relay forces one) carries the other phases; relay, a local relay that adds the
+// bearer header (a browser WebSocket cannot), is the fallback, and blip always uses it so it can cut a session off.
 // Writes OUT/result.json (latencies p50/p99 from API post to DOM appearance, console errors and failed requests per
 // phase) and screenshots. The token is read from PYRAMID2_TOKEN_FILE and never printed.
 import { chromium } from 'playwright'
@@ -18,6 +20,9 @@ const SOAK_MS = Number(process.env.SOAK_MIN ?? '10') * 60_000
 const SEEN_MS = Number(process.env.SEEN_MS ?? '30000')
 const DEADLINE = Number(process.env.DEADLINE_MS ?? String(Date.now() + 3_600_000))
 const token = readFileSync(process.env.PYRAMID2_TOKEN_FILE ?? '', 'utf8').trim()
+type Mode = 'token' | 'query' | 'cookie' | 'relay'
+let mode: Mode = (process.env.LIVE as Mode) || 'relay'
+const SESSION_COOKIE = '__Host-pyramid-session'
 mkdirSync(OUT, { recursive: true })
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -36,13 +41,23 @@ const log = (kind: string, text: string) => {
 const step = (s: string) => console.log(new Date().toISOString() + ' [' + scenario + '] ' + s)
 const save = () => writeFileSync(OUT + '/result.json', JSON.stringify(result, null, 2))
 
+// A 503 (pyramid2's 'Try again shortly' under load) is retried up to 5 times with backoff; result.retries_503 counts them.
 async function v1(path: string, init: any = {}) {
-  const res = await fetch(NODES[0] + '/v1' + path, {
-    ...init,
-    headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', ...(init.headers ?? {}) },
-  })
-  if (!res.ok) throw new Error(path + ': ' + res.status + ' ' + (await res.text()).slice(0, 300))
-  return res.status === 204 ? null : res.json()
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(NODES[0] + '/v1' + path, {
+      ...init,
+      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', ...(init.headers ?? {}) },
+    })
+    if (res.status === 503 && attempt < 5) {
+      await res.text().catch(() => '')
+      result.retries_503 = (result.retries_503 ?? 0) + 1
+      ;(result.retries_by_phase ??= {})[scenario] = (result.retries_by_phase[scenario] ?? 0) + 1
+      await sleep(250 * 2 ** attempt)
+      continue
+    }
+    if (!res.ok) throw new Error(path + ': ' + res.status + ' ' + (await res.text()).slice(0, 300))
+    return res.status === 204 ? null : res.json()
+  }
 }
 async function until(what: string, ok: () => Promise<boolean>, timeout = 45_000, every = 200) {
   const t = Date.now()
@@ -98,24 +113,29 @@ await new Promise((r) => wss.once('listening', r))
 const proxy = 'ws://127.0.0.1:' + (wss.address() as any).port + '/live'
 
 const browser = await chromium.launch({ args: ['--enable-precise-memory-info'] })
-type S = { name: string; context: any; page: any }
-async function session(name: string, live: string = proxy + '?s=' + name): Promise<S> {
+type S = { name: string; context: any; page: any; mode: Mode; first: boolean }
+// token: the web's token login in sessionStorage and its default same-origin /live; query: the same login through
+// ?token= on the first load (open adds it); cookie: the session cookie on WEB's origin, no token; relay: the token plus
+// ?live= pointing at the local relay.
+async function session(name: string, m: Mode = mode): Promise<S> {
   const context = await browser.newContext({ viewport: { width: 1280, height: 860 } })
+  if (m === 'cookie') await context.addCookies([{ name: SESSION_COOKIE, value: token, url: WEB, secure: true, httpOnly: true, sameSite: 'Lax' }])
   await context.addInitScript(
     ([t, l]: string[]) => {
       try {
-        sessionStorage.setItem('pyramid2-web.token', t)
-        sessionStorage.setItem('pyramid2-web.live', l)
+        if (t) sessionStorage.setItem('pyramid2-web.token', t)
+        if (l) sessionStorage.setItem('pyramid2-web.live', l)
+        else sessionStorage.removeItem('pyramid2-web.live')
       } catch {}
     },
-    [token, live],
+    [m === 'token' || m === 'relay' ? token : '', m === 'relay' ? proxy + '?s=' + name : ''],
   )
   const page = await context.newPage()
   page.on('console', (m: any) => m.type() === 'error' && log('console', name + ': ' + m.text()))
   page.on('pageerror', (e: any) => log('pageerror', name + ': ' + e))
   page.on('requestfailed', (r: any) => log('requestfailed', name + ': ' + r.method() + ' ' + r.url().split('?')[0] + ' ' + r.failure()?.errorText))
   page.on('response', (r: any) => r.status() >= 400 && log('http', name + ': ' + r.status() + ' ' + r.request().method() + ' ' + r.url().split('?')[0]))
-  const s = { name, context, page }
+  const s = { name, context, page, mode: m, first: true }
   opened.add(s)
   context.on('close', () => opened.delete(s))
   return s
@@ -133,7 +153,10 @@ async function evidence(tag: string) {
 const chip = async (p: any) => ((await p.locator('[aria-label^="Connection:"]').first().innerText({ timeout: 5000 }).catch(() => '?')) as string).trim().replace(/\s+/g, ' ')
 const shot = (p: any, n: string) => p.screenshot({ path: OUT + '/' + n + '.png' }).catch(() => {})
 async function open(s: S, path: string) {
-  await s.page.goto(WEB + path, { waitUntil: 'load' })
+  let url = WEB + path
+  if (s.mode === 'query' && s.first) url += (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token)
+  s.first = false
+  await s.page.goto(url, { waitUntil: 'load' })
   await until(s.name + ' synced', async () => /^Synced/.test(await chip(s.page)), 45_000, 250)
 }
 async function watch(p: any) {
@@ -183,9 +206,11 @@ async function metrics(s: S) {
   }
 }
 async function pane(p: any, timeout = 20_000) {
+  const t = Date.now()
   const ok = await p.locator('[role="log"] article').first().waitFor({ timeout }).then(() => true, () => false)
+  const ms = Date.now() - t
   const dialog = (await p.locator('[role="dialog"]').first().innerText({ timeout: 2000 }).catch(() => '<no dialog>')) as string
-  return { rendered: ok, dialog: dialog.replace(/\s+/g, ' ').slice(0, 300) }
+  return { rendered: ok, ms: ok ? ms : null, dialog: dialog.replace(/\s+/g, ' ').slice(0, 300) }
 }
 async function closeAll(ss: S[]) {
   await Promise.all(ss.map((s) => s.context.close().catch(() => {})))
@@ -199,18 +224,39 @@ async function seed() {
   result.watched = watched
 }
 
+// Each mode in turn on the web's own origin: does the chip reach Synced, is it not Fixture, and does the board list the
+// API-created seed thread? The first mode that passes all three carries the other phases (unless LIVE forces one).
 async function auth() {
-  const s = await session('auth-direct', nodeWs)
-  await s.page.goto(WEB + '/', { waitUntil: 'load' })
-  await sleep(15_000)
-  const direct = await chip(s.page)
-  await shot(s.page, 'auth-direct')
-  await s.context.close()
-  const p = await session('auth-proxy')
-  await open(p, '/')
-  const viaHeader = await chip(p.page)
-  await p.context.close()
-  return { documented_token_login_chip: direct, header_authenticated_chip: viaHeader }
+  const tried: any = {}
+  const order: Mode[] = process.env.LIVE ? [mode] : ['token', 'query', 'cookie', 'relay']
+  let picked: Mode | null = null
+  for (const m of order) {
+    const s = await session('auth-' + m, m)
+    const t0 = Date.now()
+    let synced: number | null = null
+    try {
+      await open(s, '/')
+      synced = Date.now() - t0
+    } catch {}
+    const c = await chip(s.page)
+    const board = await until('seed thread on the board', async () => (await s.page.locator('a[href*="' + watched + '"]').count()) > 0, synced == null ? 3000 : 20_000, 250).catch(() => null)
+    const links = await s.page.locator('a[href^="/t/"],a[href*="open="]').count()
+    const http = (result.logs.auth?.http ?? []).filter((x: string) => x.startsWith('auth-' + m + ':')).slice(0, 5)
+    const live = await s.page.evaluate(() => sessionStorage.getItem('pyramid2-web.live')).catch(() => null)
+    await shot(s.page, 'auth-' + m)
+    await s.context.close()
+    const ok = synced != null && !/Fixture/i.test(c) && board != null
+    tried[m] = { ok, chip: c, synced_ms: synced, fixture: /Fixture/i.test(c), seed_thread_on_board_ms: board, thread_links: links, live_override: live ? 'relay' : 'same-origin', http }
+    step(m + ' ' + JSON.stringify(tried[m]))
+    if (ok && !picked) {
+      picked = m
+      if (!process.env.ALL_MODES) break
+    }
+  }
+  if (!picked) throw new Error('no live mode synced: ' + JSON.stringify(tried))
+  mode = picked
+  result.mode = mode
+  return { mode, tried, token_login_authenticates_live: !!(tried.token?.ok || tried.query?.ok) }
 }
 
 async function basic() {
@@ -286,11 +332,11 @@ async function fanout(n: number) {
   await shot(ss[0].page, 'fanout' + n + '-s0')
   const chips = await Promise.all(ss.map((s) => chip(s.page)))
   await closeAll(ss)
-  return { sessions: n, panes_rendered: panes.filter((x) => x.rendered).length, pane_sample: panes[0], initial_load_ms: loadMs, new_thread_ms: dist(thr), new_turn_ms: dist(trn), misses: miss.slice(0, 40), miss_count: miss.length, user_message_not_exactly_once: dups.slice(0, 40), chips_not_synced: chips.filter((c) => !/^Synced/.test(c)) }
+  return { sessions: n, mode, panes_rendered: panes.filter((x) => x.rendered).length, deep_link_pane_ms: dist(panes.flatMap((x) => (x.ms == null ? [] : [x.ms]))), pane_sample: panes[0], initial_load_ms: loadMs, new_thread_ms: dist(thr), new_turn_ms: dist(trn), misses: miss.slice(0, 40), miss_count: miss.length, user_message_not_exactly_once: dups.slice(0, 40), chips_not_synced: chips.filter((c) => !/^Synced/.test(c)) }
 }
 
 async function blip() {
-  const ss = await Promise.all(Array.from({ length: 4 }, (_, i) => session('blip-' + i)))
+  const ss = await Promise.all(Array.from({ length: 4 }, (_, i) => session('blip-' + i, 'relay')))
   await Promise.all(ss.map((s) => open(s, '/?open=' + encodeURIComponent(watched))))
   const panes = await Promise.all(ss.map((s) => pane(s.page, 30_000)))
   await Promise.all(ss.map((s) => watch(s.page)))
@@ -380,6 +426,18 @@ async function subagents() {
   const id = await newThread()
   const tag = 'sub' + randomUUID().slice(0, 6)
   await turn(id, 'e2e:swarm 4 ' + tag)
+  // The API first: the snapshot's thread.subagents lists the running children.
+  let apiMax = 0, apiFirst: number | null = null
+  const t0 = Date.now()
+  await until('subagent rows in the API', async () => {
+    const snap = await v1('/threads/' + id + '/snapshot')
+    const n = (snap.thread?.subagents ?? []).length
+    if (n > apiMax) apiMax = n
+    if (n > 0 && apiFirst == null) apiFirst = Date.now() - t0
+    return apiMax >= 4
+  }, 60_000, 300).catch(() => {})
+  const api = { max_running_subagents: apiMax, first_row_ms: apiFirst }
+  step('api ' + JSON.stringify(api))
   const s = await session('subagents')
   await open(s, '/t/' + encodeURIComponent(id))
   await shot(s.page, 'subagents-1-board-early')
@@ -399,7 +457,7 @@ async function subagents() {
   await shot(s.page, 'subagents-3-thread')
   const st = await stuck(s.page)
   await s.context.close()
-  return { thread: id, child_links_on_board: children, sections, articles, shows_children_done: /child \d+ done/.test(text), stuck: st }
+  return { thread: id, api, child_links_on_board: children, sections, articles, shows_children_done: /child \d+ done/.test(text), stuck: st }
 }
 
 async function soak() {

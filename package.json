@@ -15,7 +15,8 @@
     "build:ts": "tsc -p tsconfig.build.json && tsc -p tsconfig.cloudflare.build.json",
     "check": "vp check --fix",
     "check:types": "tsc --noEmit && tsc --noEmit -p tsconfig.vercel.json && tsc --noEmit -p tsconfig.cloudflare.json",
-    "prepare": "node scripts/prepare.mjs"
+    "prepare": "node scripts/prepare.mjs",
+    "test": "node --test 'test/board*.test.ts'"
   },
   "exports": {
     ".": {

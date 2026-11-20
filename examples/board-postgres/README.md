@@ -69,3 +69,39 @@ w3 claimed 2, done 2, lost 0, steers 1, errors 0
 ```
 
 w2 is killed 300 ms into `fetch-b` and its lease runs out about 1.2 s later. w3 takes the task over and finishes it, and `fetch-b` ends up with `agent:w3` as its worker. The cap shows while w2's claim is still live: w1 and the dead w2 hold two `agent=llm` tasks, so w3 sits idle with `fetch-c` ready until `fetch-a` is done. The steer is sent while w3 holds `summarize`, and it is heeded before the finish. Which worker gets which task changes from run to run, and the `lapse` line shows only when one of the lead's polls lands between the lapse and the takeover.
+
+## Soak
+
+[soak.ts](soak.ts) runs the same setup under takeover chaos until a time limit. Each swarm posts 30 tasks to a fresh schema: a layered graph where each task needs up to two of the eight before it, about 40% labelled `agent=llm` (cap 2) and 20% `tool=browser` (cap 1). Six worker processes drain it, each a `Board.pool` with `concurrency: 2` and a 2 s lease. Swarms rotate between every worker woken by `Sql.wake`, every worker polling, and half of each. While a swarm runs, the driver:
+
+- SIGKILLs a random worker every 2-8 s and starts a new one,
+- SIGSTOPs a worker that holds a task for 2.5-5 s, longer than its lease, then SIGCONTs it, so it wakes after losing the lease,
+- restarts Postgres with `pg_ctl restart -m fast` in about 30% of swarms,
+- steers a held task now and then.
+
+After each swarm it audits from a fresh connection. It replays the raw log and checks that every task finished exactly once with `done`, that no claim came before its needs were done or while another lease was live, that no claim took a label past its cap, and that every renew and finish carried the live claim's id, so a resumed holder never finished on a claim another worker had taken over. It also checks that each task's `Task.worker` is the actor whose finish landed, that nothing is still claimed after the leases lapse, and that no `soak_` schema is left. On a violation it stops, keeps the schema, writes the timeline, raw log and violations to `output/board-postgres-soak/`, and prints a `SOAK_SEED=… SOAK_SWARMS=1` line that replays the same graph and chaos choices (the timing still varies).
+
+```sh
+PATH=$BIN:$PATH DATABASE_URL=postgres://postgres@127.0.0.1:54329/postgres \
+  SOAK_PGDATA="$PG/data" SOAK_MINUTES=45 npm run example:board-postgres:soak
+```
+
+`SOAK_PGDATA` turns on the Postgres restarts and needs `pg_ctl` on `PATH` (or `SOAK_PG_CTL`). Each swarm prints one JSON line, and the run ends with a `totals` line.
+
+Two runs on Node 22.23 and Postgres 16.15, pinned to 4 cores of a 48-core Linux box:
+
+| | Run 1 | Run 2 |
+| --- | --- | --- |
+| Minutes | 25.0 | 25.2 |
+| Swarms (30 tasks each) | 102 | 103 |
+| Worker SIGKILLs | 214 | 192 |
+| SIGSTOPs past the lease | 153 | 157 |
+| Postgres restarts | 34 | 38 |
+| Steers | 342 | 328 |
+| Takeovers (after a Postgres restart) | 309 (31) | 326 (53) |
+| Takeover latency p50 / p99 / max | 1778 / 4433 / 5854 ms | 1773 / 4356 / 6074 ms |
+| Board violations | 0 | 0 |
+
+Takeover latency runs from the SIGKILL or SIGSTOP of the holder to another worker's claim, so it starts with what was left of the 2 s lease. In run 2, 157 renews or finishes by resumed workers on the claims they held before the pause were refused (`NotHolder` while the new holder ran, `Terminal` once it had finished); 7 resumed workers finished their task because nobody had claimed it while they slept, and 1 claimed its task again after the next holder's lease lapsed too and finished on that new claim. The 725 pool errors were calls that failed while Postgres restarted; the pools retried them.
+
+Run 1 stopped at swarm 102 on a false alarm from an earlier version of the resumed-holder check. A paused worker's renew of `t10` was refused with `NotHolder`; the worker that took `t10` over lost its own lease during a Postgres restart; the resumed worker then claimed `t10` afresh and finished on that new claim. The log audit had passed. The check now compares claim ids, and run 2 used it.

@@ -522,7 +522,8 @@ async function run(cell: Cell) {
   const writeCount = total(writes)
   const errorCount = Object.values(errors).reduce((acc, count) => acc + count, 0)
   const seconds = audited.elapsedMs / 1000
-  const distinct = (values: string[]) => [...new Set(values.filter(Boolean))].slice(0, 3)
+  const distinct = (values: (string | undefined)[]) =>
+    [...new Set(values.filter(Boolean))].slice(0, 3)
   const lastErrors = distinct(all.map((entry) => entry.metrics.lastError))
   const refreshMs = sum((entry) => entry.metrics.refreshMs)
   const refreshes = sum((entry) => entry.metrics.refreshes)

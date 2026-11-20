@@ -16,7 +16,10 @@ const log = (who: string, what: string) =>
 async function connect(name: string) {
   const sql = Sql.open(path)
   const board = await Board.open({ sql, scope: 'demo', actor: 'agent:' + name })
-  const agents = { who: [{ kind: 'kind', id: 'agent' } as const], can: { '*': ['manage' as const] } }
+  const agents = {
+    who: [{ kind: 'kind', id: 'agent' } as const],
+    can: { '*': ['manage' as const] },
+  }
   await board.grant(agents, { key: 'agents' }) // refused for everyone but the chartering lead
   return { board, sql }
 }
@@ -70,7 +73,8 @@ for (;;) {
 }
 
 await Promise.all(pools.map((pool) => pool.stop()))
-for (const task of await lead.board.tasks()) log('lead', `result ${task.id}: ${JSON.stringify(task.outcome)}`)
+for (const task of await lead.board.tasks())
+  log('lead', `result ${task.id}: ${JSON.stringify(task.outcome)}`)
 pools.forEach((pool, index) => console.log('w' + (index + 1), JSON.stringify(pool.stats())))
 
 for (const { board, sql } of [lead, ...members]) {

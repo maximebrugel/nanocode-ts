@@ -317,6 +317,50 @@ if (process.env.NC_POOL_CHILD) {
       await close()
     })
 
+    test('a label cap bounds kind=agent tasks across two pools while untagged tasks flow', async () => {
+      const path = file()
+      const left = await open(path, 'left')
+      const right = await open(path, 'right')
+      for (let index = 0; index < 8; index++)
+        ok(await left.board.post({ id: 'a' + index, spec: 'agent', labels: { kind: 'agent' } }))
+      for (let index = 0; index < 8; index++)
+        ok(await left.board.post({ id: 'u' + index, spec: 'untagged' }))
+
+      let agents = 0
+      let mostAgents = 0
+      let alongside = 0
+      const work = (actor: string) => async (task: Board.Task) => {
+        const agent = task.labels.kind === 'agent'
+        if (agent) mostAgents = Math.max(mostAgents, ++agents)
+        else if (agents === 2) alongside++
+        await sleep(agent ? 60 : 20)
+        if (agent) agents--
+        return { done: actor }
+      }
+      const options = {
+        cap: { max: 2, label: ['kind', 'agent'] as [string, string] },
+        concurrency: 3,
+        leaseMs: 10_000,
+        pollMs: 10,
+        idleMs: 400,
+      }
+      const pools = [
+        Board.pool(left.board, { ...options, run: work('left') }),
+        Board.pool(right.board, { ...options, run: work('right') }),
+      ]
+      await Promise.all(pools.map((pool) => pool.idle()))
+      const [a, b] = pools.map((pool) => pool.stats())
+
+      assert.equal(mostAgents, 2)
+      assert.ok(alongside > 0, 'no untagged task ran while two agent tasks were held')
+      assert.equal(a!.done + b!.done, 16, JSON.stringify({ a, b }))
+      assert.equal(a!.lost + b!.lost, 0, JSON.stringify({ a, b }))
+      await right.board.refresh()
+      for (const task of await right.board.tasks()) assert.equal(task.phase, 'done', task.id)
+      await left.close()
+      await right.close()
+    })
+
     test('a lost lease finishes nothing, and a run that throws finishes failed', async () => {
       const path = file()
       const alice = await open(path, 'alice')

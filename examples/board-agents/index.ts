@@ -28,19 +28,6 @@ async function connect(name: string) {
   return { board, sql }
 }
 
-// Board.pool claims without a cap, so hand it a board whose claim adds the label cap to
-// kind=agent tasks. The board counts live leases on kind=agent tasks, whichever pool holds them.
-const cap: Board.Cap = { max: 2, label: ['kind', 'agent'] }
-function capped(board: Board.Board): Board.Board {
-  return {
-    ...board,
-    async claim(id, options) {
-      const task = await board.task(id)
-      return board.claim(id, task?.labels.kind === 'agent' ? { ...options, cap } : options)
-    },
-  }
-}
-
 // One agent turn in its own in-memory session: submit the prompt, drive it, read the answer.
 let wasm: Promise<WebAssembly.Module> | undefined
 async function agentTurn(apiKey: string, prompt: string): Promise<string> {
@@ -180,7 +167,8 @@ const worker = (name: string, board: Board.Board) => async (task: Board.Task) =>
 
 const members = await Promise.all([connect('w1'), connect('w2')])
 const pools = members.map(({ board }, index) =>
-  Board.pool(capped(board), {
+  Board.pool(board, {
+    cap: { max: 2, label: ['kind', 'agent'] },
     concurrency: 2,
     leaseMs: key ? 60_000 : 5_000,
     pollMs: 20,

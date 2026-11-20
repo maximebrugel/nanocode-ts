@@ -10,6 +10,7 @@ export type PoolLease = Board.Lease & {
 
 export type PoolOptions = {
   label?: [string, string] | undefined
+  cap?: Board.Cap | ((task: Board.Task) => Board.Cap | undefined) | undefined
   concurrency: number
   leaseMs: number
   pollMs: number
@@ -54,7 +55,7 @@ type Worker = {
   untilMs: number
   state: Phase
   delivered: number
-  timer: ReturnType<typeof setInterval> | undefined
+  timer: ReturnType<typeof setInterval>
   renewing: Promise<void>
   settled: Promise<void>
 }
@@ -69,6 +70,13 @@ const unknown = (error: unknown): Board.Rejection => ({ kind: 'Unknown', value: 
 
 const refused = (error: unknown): Board.Verdict => ({ ok: false, rejection: unknown(error) })
 
+function capped(cap: PoolOptions['cap'], task: Board.Task): Board.Cap | undefined {
+  const chosen = typeof cap === 'function' ? cap(task) : cap
+  if (typeof chosen === 'object' && task.labels[chosen.label[0]] !== chosen.label[1])
+    return undefined
+  return chosen
+}
+
 function outcome(value: unknown): Board.Outcome {
   const record = value as Record<string, unknown> | null
   if (record && typeof record.done === 'string') return { done: record.done }
@@ -77,7 +85,7 @@ function outcome(value: unknown): Board.Outcome {
 }
 
 export function pool(board: Board.Board, options: PoolOptions): Pool {
-  const { label, concurrency, leaseMs, pollMs, idleMs, run } = options
+  const { label, cap, concurrency, leaseMs, pollMs, idleMs, run } = options
   if (!Number.isSafeInteger(concurrency) || concurrency < 1)
     throw new Error('concurrency must be a positive integer')
   if (!Number.isSafeInteger(leaseMs) || leaseMs < 1)
@@ -203,7 +211,12 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
       untilMs: claimed.untilMs,
       state: { phase: 'running' },
       delivered: 0,
-      timer: undefined,
+      timer: setInterval(
+        () => {
+          worker.renewing = worker.renewing.then(() => renew(worker))
+        },
+        Math.max(1, Math.floor(leaseMs / 3)),
+      ),
       renewing: Promise.resolve(),
       settled: Promise.resolve(),
     }
@@ -227,12 +240,6 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
       },
       heed: (seq) => heed(worker, seq),
     }
-    worker.timer = setInterval(
-      () => {
-        worker.renewing = worker.renewing.then(() => renew(worker))
-      },
-      Math.max(1, Math.floor(leaseMs / 3)),
-    )
     running.set(task.id, worker)
     stats.running = running.size
     worker.settled = (async () => {
@@ -269,7 +276,11 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
         for (const task of ready) {
           if (stats.state !== 'running' || running.size >= concurrency) break
           if (running.has(task.id)) continue
-          const claimed = await board.claim(task.id, { leaseMs })
+          const limit = capped(cap, task)
+          const claimed = await board.claim(
+            task.id,
+            limit === undefined ? { leaseMs } : { cap: limit, leaseMs },
+          )
           if (!claimed.ok) continue
           stats.claimed++
           start(task, claimed)
@@ -288,8 +299,12 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
     else if (now - idleSince >= idleMs) void shut('retired')
   }
 
+  const unschedule = () => {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+
   const schedule = () => {
-    clearTimeout(timer)
+    unschedule()
     if (stats.state === 'running') timer = setTimeout(kick, pollMs)
   }
 
@@ -299,7 +314,7 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
       again = true
       return
     }
-    clearTimeout(timer)
+    unschedule()
     ticking = tick().finally(() => {
       ticking = undefined
       if (again) {
@@ -312,7 +327,7 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
   function shut(state: 'stopped' | 'retired') {
     if (stopping) return stopping
     stats.state = 'stopping'
-    clearTimeout(timer)
+    unschedule()
     stopping = (async () => {
       await ticking
       const held = [...running.values()].filter((worker) => worker.state.phase === 'running')

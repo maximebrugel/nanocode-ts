@@ -361,6 +361,46 @@ if (process.env.NC_POOL_CHILD) {
       await right.close()
     })
 
+    test('when a capped run ends, the freed slot goes to a lapsed task before an open one', async () => {
+      const path = file()
+      const alice = await open(path, 'alice')
+      const ghost = await open(path, 'ghost')
+      const agent = { kind: 'agent' }
+      ok(await alice.board.post({ id: 'first', spec: 'holds the cap', labels: agent }))
+      let release = (_: unknown) => {}
+      const gate = new Promise((resolve) => (release = resolve))
+      const order: string[] = []
+      const tookOver = new Map<string, boolean>()
+      const pool = Board.pool(alice.board, {
+        cap: { max: 1, label: ['kind', 'agent'] },
+        concurrency: 3,
+        leaseMs: 10_000,
+        pollMs: 10,
+        async run(task, lease) {
+          order.push(task.id)
+          tookOver.set(task.id, lease.tookOver)
+          if (task.id === 'first') await gate
+          return { done: 'alice' }
+        },
+      })
+      await until('alice to start first', () => order.length === 1)
+      // Posted before the lapsed task, so the board lists it first.
+      ok(await alice.board.post({ id: 'fresh', spec: 'open', labels: agent }))
+      ok(await alice.board.post({ id: 'orphan', spec: 'its holder died', labels: agent }))
+      await ghost.board.refresh()
+      ok(await ghost.board.claim('orphan', { leaseMs: 50 }))
+      await sleep(100)
+      assert.equal(await phase(alice.board, 'fresh'), 'open')
+      assert.equal((await alice.board.task('orphan'))?.stage, 'lapsed')
+      release(null)
+      await until('all three to finish', () => pool.stats().done === 3)
+      assert.deepEqual(order, ['first', 'orphan', 'fresh'])
+      assert.equal(tookOver.get('orphan'), true)
+      await pool.stop()
+      await alice.close()
+      await ghost.close()
+    })
+
     test('a lost lease finishes nothing, and a run that throws finishes failed', async () => {
       const path = file()
       const alice = await open(path, 'alice')

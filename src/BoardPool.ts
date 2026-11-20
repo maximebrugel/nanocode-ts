@@ -293,7 +293,12 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
     try {
       await board.refresh()
       if (running.size < concurrency) {
-        const ready = await board.ready(label ? { label } : undefined)
+        // Lapsed tasks first: a dead holder's task waits behind no fresh one for a cap slot.
+        const listed = await board.ready(label ? { label } : undefined)
+        const ready = [
+          ...listed.filter((task) => task.stage === 'lapsed'),
+          ...listed.filter((task) => task.stage !== 'lapsed'),
+        ]
         for (const task of ready) {
           if (stats.state !== 'running' || running.size >= concurrency) break
           if (running.has(task.id)) continue

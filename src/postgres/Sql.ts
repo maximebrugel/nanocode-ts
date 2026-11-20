@@ -27,6 +27,7 @@ export type Options = {
 }
 
 const twins: ReadonlyMap<string, string> = new Map([
+  ['SELECT NULL', 'SELECT pg_advisory_xact_lock(7061636193)'],
   [
     'CREATE TABLE IF NOT EXISTS nanocode_log (scope TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (scope, seq)) WITHOUT ROWID',
     'CREATE TABLE IF NOT EXISTS nanocode_log (scope TEXT NOT NULL, seq BIGINT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (scope, seq))',

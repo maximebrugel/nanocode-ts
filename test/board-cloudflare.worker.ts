@@ -30,6 +30,9 @@ const methods = new Set([
   'refresh',
   'charter',
   'grant',
+  'group',
+  'opened',
+  'checkpoint',
   'close',
 ])
 
@@ -58,6 +61,11 @@ export class BoardObject extends DurableObject<Env> {
     // Drops this instance; the next request constructs a new one over the same storage.
     if (call.method === 'abort') this.ctx.abort('board-cloudflare test restart')
     if (call.method === 'boot') return Response.json({ boot: this.boot, value: null })
+    // Drops every fold checkpoint, so the next open replays the whole log.
+    if (call.method === 'drop_checkpoints') {
+      this.ctx.storage.sql.exec('DELETE FROM nanocode_checkpoint')
+      return Response.json({ boot: this.boot, value: null })
+    }
     if (!methods.has(call.method))
       return Response.json(
         { boot: this.boot, error: 'unknown method ' + call.method },

@@ -318,6 +318,37 @@ describe('Board in a Cloudflare Durable Object', { timeout: 120_000 }, () => {
     ok(await bob<Verdict>('finish', 's3', s3.claim, { done: 'after two restarts' }))
   })
 
+  test('a restarted object opens from its fold checkpoint to the state a full replay folds', async () => {
+    const alice = handle('checkpoint', 'alice')
+    await charter(alice)
+    const events = 10_000
+    for (let from = 0; from < events; from += 1_000) {
+      const writes = Array.from({ length: 1_000 }, (_, index) => {
+        const n = from + index
+        return n % 4 === 3
+          ? { op: { op: 'cancel', task: 't' + (n - 1), reason: 'gone' } }
+          : { op: { op: 'post', task: { id: 't' + n, spec: 'task ' + n } } }
+      })
+      for (const verdict of await alice<Verdict[]>('group', writes)) ok(verdict)
+    }
+    const live = await alice<Task[]>('tasks')
+    assert.equal(await alice<boolean>('checkpoint'), true)
+
+    await abort('checkpoint')
+    const bob = handle('checkpoint', 'bob')
+    const restored = await bob<Task[]>('tasks')
+    const [opened] = await bob<{ from: string; seq?: number; tail?: number }[]>('opened')
+    assert.equal(opened!.from, 'checkpoint', JSON.stringify(opened))
+    assert.equal(opened!.tail, 0)
+    assert.deepEqual(restored, live)
+
+    await send('checkpoint', { actor: 'none', method: 'drop_checkpoints' })
+    await abort('checkpoint')
+    const carol = handle('checkpoint', 'carol')
+    assert.deepEqual(await carol('opened'), [{ from: 'replay', fallback: 'missing' }])
+    assert.deepEqual(await carol<Task[]>('tasks'), live)
+  })
+
   test('a lease that lapses on the wall clock is taken over by the other handle', async () => {
     const alice = handle('takeover', 'alice')
     const bob = handle('takeover', 'bob')

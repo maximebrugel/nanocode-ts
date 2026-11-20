@@ -174,6 +174,53 @@ if (process.env.NC_BOARD_CHILD) {
     postgres ? 'Board over Postgres' : 'Board over node:sqlite',
     { timeout: 180_000 },
     () => {
+      test('a reopen folds from the newest checkpoint to the same state as a full replay', async () => {
+        const path = file()
+        const t = Date.now()
+        const first = await open(path, 'alice')
+        const events = 10_000
+        for (let from = 0; from < events; from += 500) {
+          const writes = Array.from({ length: 500 }, (_, index): Board.Write => {
+            const n = from + index
+            return n % 4 === 3
+              ? { op: { op: 'cancel', task: 't' + (n - 1), reason: 'gone' }, atMs: t }
+              : { op: { op: 'post', task: { id: 't' + n, spec: 'task ' + n } }, atMs: t }
+          })
+          for (const verdict of await first.board.group(writes)) ok(verdict)
+        }
+        const live = await first.board.tasks(t)
+        assert.ok(live.length >= (events / 4) * 3)
+        assert.equal(await first.board.checkpoint(), true)
+        await first.close()
+
+        const reopened = await open(path, 'bob')
+        const [opened] = await reopened.board.opened()
+        assert.equal(opened!.from, 'checkpoint')
+        // The checkpoint covers every row: the charter, the grant and the 10k writes.
+        assert.deepEqual(opened, { from: 'checkpoint', seq: events + 2, tail: 0 })
+        const restored = await reopened.board.tasks(t)
+        await reopened.close()
+
+        // Drop the checkpoints so the next open replays the whole log, and compare.
+        const admin = postgres ? Postgres.open(postgres, { schema: path }) : Sql.open(path)
+        try {
+          await admin.transaction(
+            'log',
+            'drop_checkpoints',
+            [['DELETE FROM nanocode_checkpoint WHERE scope = ?1', scope]],
+            'write',
+          )
+        } finally {
+          await admin.close()
+        }
+        const replayed = await open(path, 'carol')
+        assert.deepEqual(await replayed.board.opened(), [{ from: 'replay', fallback: 'missing' }])
+        const full = await replayed.board.tasks(t)
+        await replayed.close()
+        assert.deepEqual(restored, full)
+        assert.deepEqual(restored, live)
+      })
+
       test('needs keep a task Waiting until they are done', async () => {
         const { board, close } = await open(file(), 'alice')
         const t = Date.now()

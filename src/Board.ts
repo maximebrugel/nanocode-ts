@@ -135,6 +135,17 @@ export type Options = {
 
 export type MemorySql = Contracts.SqlHost & { close(): void }
 
+// How one partition came to its fold when the board opened: from its scope's newest fold
+// checkpoint and the tail rows after it, or from a full replay and why the checkpoint was not used.
+export type Opened =
+  | { from: 'checkpoint'; seq: number; tail: number }
+  | { from: 'resumed' }
+  | {
+      from: 'replay'
+      fallback: 'unsupported' | 'missing' | 'unread' | 'version' | 'corrupt' | 'tail'
+      detail?: string
+    }
+
 export class LeaseLost extends Error {
   readonly task: string
   readonly rejection: Rejection | undefined
@@ -169,6 +180,11 @@ export type Board = {
   tasks(atMs?: number): Promise<Task[]>
   held(atMs?: number): Promise<Task[]>
   refresh(): Promise<void>
+  // How each partition opened; see Opened.
+  opened(): Promise<Opened[]>
+  // Saves each partition's fold as its scope's checkpoint, so the next open folds only the rows
+  // after it. close() does this too. Resolves whether any partition saved one.
+  checkpoint(): Promise<boolean>
   charter(atMs?: number): Promise<Verdict>
   grant(grant: Grant, options?: { key?: string; atMs?: number }): Promise<Verdict>
   revoke(event: string, options?: { key?: string; atMs?: number }): Promise<Verdict>
@@ -450,6 +466,14 @@ function wrap(runtime: AgentRuntime.AgentRuntime, board: number, options: Option
       } finally {
         clearInterval(timer)
       }
+    },
+
+    opened() {
+      return call({ opened: { board } }) as Promise<Opened[]>
+    },
+
+    checkpoint() {
+      return call({ checkpoint: { board } }) as Promise<boolean>
     },
 
     async close() {

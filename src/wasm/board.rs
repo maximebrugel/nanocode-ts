@@ -4,6 +4,7 @@ use nanocode::turnlog::{LogHost, SqlLog};
 use nanocode_board::{
     Applied, Board, BoardError, Cap, ClaimId, Op, Phase, Rejection, Task, TaskId,
     access::{Identity, Verifier},
+    checkpoint::{Fallback, Opened},
     shards::{self, Merged, Route},
     steer::Steer,
 };
@@ -14,11 +15,17 @@ use super::store::WorkerStore;
 
 thread_local! {
     static BOARDS: RefCell<BTreeMap<u32, Option<Vec<Board>>>> = const { RefCell::new(BTreeMap::new()) };
+    /// Per open board, each partition's next seq when it last opened from or saved a checkpoint,
+    /// so a close does not rewrite a checkpoint the fold has not moved past.
+    static SAVED: RefCell<BTreeMap<u32, Vec<u64>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Request {
+    Checkpoint {
+        board: u32,
+    },
     Close {
         board: u32,
     },
@@ -30,6 +37,9 @@ pub(crate) enum Request {
         actor: String,
         partitions: NonZeroU32,
         scope: String,
+    },
+    Opened {
+        board: u32,
     },
     Ready {
         at_ms: u64,
@@ -81,8 +91,19 @@ impl Verifier for Trusted {
 
 pub(crate) async fn execute(request: Request) -> Result<Value, String> {
     match request {
+        Request::Checkpoint { board } => {
+            let mut boards = take(board)?;
+            let saved = checkpoint(board, &mut boards, true).await;
+            put(board, boards);
+            saved.map(Value::Bool)
+        }
         Request::Close { board } => {
-            BOARDS.with_borrow_mut(|boards| boards.remove(&board));
+            // A closing board saves its fold for the next open; a failed save only means that
+            // open replays more, so the close still succeeds.
+            if let Some(Some(mut boards)) = BOARDS.with_borrow_mut(|boards| boards.remove(&board)) {
+                let _ = checkpoint(board, &mut boards, false).await;
+            }
+            SAVED.with_borrow_mut(|saved| saved.remove(&board));
             Ok(Value::Null)
         }
         Request::Group { board, writes } => {
@@ -96,6 +117,16 @@ pub(crate) async fn execute(request: Request) -> Result<Value, String> {
             partitions,
             scope,
         } => open(&scope, &actor, partitions).await,
+        Request::Opened { board } => BOARDS.with_borrow(|boards| {
+            let boards = boards
+                .get(&board)
+                .ok_or_else(|| unknown(board))?
+                .as_ref()
+                .ok_or_else(|| busy(board))?;
+            Ok(Value::Array(
+                boards.iter().map(|board| opened(board.opened())).collect(),
+            ))
+        }),
         Request::Ready {
             at_ms,
             board,
@@ -184,12 +215,72 @@ async fn open(scope: &str, actor: &str, partitions: NonZeroU32) -> Result<Value,
     let boards = shards::open(&host, scope, partitions, &identity)
         .await
         .map_err(|error| error.to_string())?;
+    let saved = boards
+        .iter()
+        .map(|board| match board.opened() {
+            Opened::Checkpoint { .. } => board.fold().next(),
+            Opened::Resumed | Opened::Replay(_) => 0,
+        })
+        .collect();
     let handle = BOARDS.with_borrow_mut(|open| {
         let handle = open.last_key_value().map_or(0, |(last, _)| last + 1);
         open.insert(handle, Some(boards));
         handle
     });
+    SAVED.with_borrow_mut(|all| all.insert(handle, saved));
     Ok(json!(handle))
+}
+
+/// Saves each partition's fold as its scope's checkpoint; unless forced, only the partitions
+/// whose fold moved past the checkpoint this handle opened from or saved last. Returns whether
+/// any partition saved one.
+async fn checkpoint(handle: u32, boards: &mut [Board], force: bool) -> Result<bool, String> {
+    let mut marks = SAVED.with_borrow(|saved| saved.get(&handle).cloned().unwrap_or_default());
+    marks.resize(boards.len(), 0);
+    let mut any = false;
+    let mut failed = None;
+    for (board, mark) in boards.iter_mut().zip(&mut marks) {
+        let next = board.fold().next();
+        if !force && next == *mark {
+            continue;
+        }
+        match board.checkpoint().await {
+            Ok(true) => {
+                *mark = next;
+                any = true;
+            }
+            Ok(false) => {}
+            Err(error) => failed = Some(error.to_string()),
+        }
+    }
+    SAVED.with_borrow_mut(|saved| {
+        if let Some(slot) = saved.get_mut(&handle) {
+            *slot = marks;
+        }
+    });
+    failed.map_or(Ok(any), Err)
+}
+
+fn opened(opened: &Opened) -> Value {
+    match opened {
+        Opened::Resumed => json!({ "from": "resumed" }),
+        Opened::Checkpoint { seq, tail } => json!({ "from": "checkpoint", "seq": seq, "tail": tail }),
+        Opened::Replay(fallback) => {
+            let (kind, detail) = match fallback {
+                Fallback::Unsupported => ("unsupported", None),
+                Fallback::Missing => ("missing", None),
+                Fallback::Unread(detail) => ("unread", Some(detail)),
+                Fallback::Version(detail) => ("version", Some(detail)),
+                Fallback::Corrupt(detail) => ("corrupt", Some(detail)),
+                Fallback::Tail => ("tail", None),
+            };
+            let mut out = json!({ "fallback": kind, "from": "replay" });
+            if let (Value::Object(out), Some(detail)) = (&mut out, detail) {
+                out.insert("detail".into(), Value::String(detail.clone()));
+            }
+            out
+        }
+    }
 }
 
 fn take(board: u32) -> Result<Vec<Board>, String> {

@@ -56,6 +56,22 @@ const twins: ReadonlyMap<string, string> = new Map([
     'DELETE FROM nanocode_log WHERE scope = ?1 AND seq >= CAST(?2 AS INTEGER) AND seq < CAST(?3 AS INTEGER)',
     'DELETE FROM nanocode_log WHERE scope = $1::text AND seq >= CAST($2::text AS BIGINT) AND seq < CAST($3::text AS BIGINT)',
   ],
+  [
+    'CREATE TABLE IF NOT EXISTS nanocode_checkpoint (scope TEXT NOT NULL, part INTEGER NOT NULL, parts INTEGER NOT NULL, seq INTEGER NOT NULL, version TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (scope, part)) WITHOUT ROWID',
+    'CREATE TABLE IF NOT EXISTS nanocode_checkpoint (scope TEXT NOT NULL, part INTEGER NOT NULL, parts INTEGER NOT NULL, seq BIGINT NOT NULL, version TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (scope, part))',
+  ],
+  [
+    'SELECT CAST(part AS TEXT), CAST(parts AS TEXT), CAST(seq AS TEXT), version, body FROM nanocode_checkpoint WHERE scope = ?1 ORDER BY part',
+    'SELECT CAST(part AS TEXT), CAST(parts AS TEXT), CAST(seq AS TEXT), version, body FROM nanocode_checkpoint WHERE scope = $1::text ORDER BY part',
+  ],
+  [
+    'DELETE FROM nanocode_checkpoint WHERE scope = ?1',
+    'DELETE FROM nanocode_checkpoint WHERE scope = $1::text',
+  ],
+  [
+    'INSERT INTO nanocode_checkpoint (scope, part, parts, seq, version, body) VALUES (?1, CAST(?2 AS INTEGER), CAST(?3 AS INTEGER), CAST(?4 AS INTEGER), ?5, ?6)',
+    'INSERT INTO nanocode_checkpoint (scope, part, parts, seq, version, body) VALUES ($1::text, CAST($2::text AS INTEGER), CAST($3::text AS INTEGER), CAST($4::text AS BIGINT), $5::text, $6::text)',
+  ],
 ])
 
 const sqliteOnly = /\bWITHOUT\s+ROWID\b|\bINDEXED\s+BY\b|\bAS\s+BLOB\b|\bPRAGMA\b|\bINSERT\s+OR\b/i

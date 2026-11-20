@@ -327,7 +327,7 @@ describe('Board in a Cloudflare Durable Object', { timeout: 120_000 }, () => {
         const n = from + index
         return n % 4 === 3
           ? { op: { op: 'cancel', task: 't' + (n - 1), reason: 'gone' } }
-          : { op: { op: 'post', task: { id: 't' + n, spec: 'task ' + n } } }
+          : { op: { op: 'post', task: { id: 't' + n, spec: 'task ' + n, labels: {}, needs: [] } } }
       })
       for (const verdict of await alice<Verdict[]>('group', writes)) ok(verdict)
     }

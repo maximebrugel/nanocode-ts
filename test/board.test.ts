@@ -184,7 +184,7 @@ if (process.env.NC_BOARD_CHILD) {
             const n = from + index
             return n % 4 === 3
               ? { op: { op: 'cancel', task: 't' + (n - 1), reason: 'gone' }, atMs: t }
-              : { op: { op: 'post', task: { id: 't' + n, spec: 'task ' + n } }, atMs: t }
+              : { op: { op: 'post', task: { id: 't' + n, spec: 'task ' + n, labels: {}, needs: [] } }, atMs: t }
           })
           for (const verdict of await first.board.group(writes)) ok(verdict)
         }

@@ -145,7 +145,8 @@ async function send(object: string, body: object): Promise<Reply> {
     body: JSON.stringify(body),
   })
   const reply = (await response.json()) as Reply
-  if (reply.error) assert.fail(JSON.stringify(body) + ' failed in the Durable Object:\n' + reply.error)
+  if (reply.error)
+    assert.fail(JSON.stringify(body) + ' failed in the Durable Object:\n' + reply.error)
   return reply
 }
 
@@ -185,7 +186,14 @@ function rejected(verdict: { ok: boolean }, kind: string) {
 
 type Verdict = { ok: boolean; seq: number; rejection?: { kind: string } }
 type Claimed = Verdict & { claim: string; untilMs: number; tookOver: boolean }
-type Task = { id: string; phase: string; stage: string; claim: string | null; worker: string | null; outcome: unknown }
+type Task = {
+  id: string
+  phase: string
+  stage: string
+  claim: string | null
+  worker: string | null
+  outcome: unknown
+}
 type Steer = { seq: number; by: string; body: string }
 
 // The board's first opener charters it; like the conformance suite, it lets every agent manage it.
@@ -224,7 +232,10 @@ describe('Board in a Cloudflare Durable Object', { timeout: 120_000 }, () => {
     const again = ok(await alice<Verdict>('post', { id: 'a', spec: 'first' }, { key: 'post-a' }))
     assert.equal(again.seq, posted.seq)
     await bob('refresh')
-    assert.deepEqual((await bob<Task[]>('ready')).map((one) => one.id), ['a'])
+    assert.deepEqual(
+      (await bob<Task[]>('ready')).map((one) => one.id),
+      ['a'],
+    )
 
     const claimed = ok(await alice<Claimed>('claim', 'a', { leaseMs: 60_000 }))
     assert.equal(claimed.tookOver, false)
@@ -257,7 +268,9 @@ describe('Board in a Cloudflare Durable Object', { timeout: 120_000 }, () => {
     await charter(alice)
     const posts: number[] = []
     for (const id of ['s1', 's2', 's3'])
-      posts.push(ok(await alice<Verdict>('post', { id, spec: 'seeded ' + id }, { key: 'seed-' + id })).seq)
+      posts.push(
+        ok(await alice<Verdict>('post', { id, spec: 'seeded ' + id }, { key: 'seed-' + id })).seq,
+      )
     const first = ok(await alice<Claimed>('claim', 's1', { leaseMs: 600_000 }))
     const second = ok(await alice<Claimed>('claim', 's2', { leaseMs: 600_000 }))
     ok(await alice<Verdict>('finish', 's2', second.claim, { done: 'seeded' }))
@@ -292,7 +305,10 @@ describe('Board in a Cloudflare Durable Object', { timeout: 120_000 }, () => {
     // A new workerd process over the same storage directory, which holds the objects' SQLite files.
     await stop()
     const files = readdirSync(storage, { recursive: true }).map(String)
-    assert.ok(files.some((file) => file.endsWith('.sqlite')), files.join(', '))
+    assert.ok(
+      files.some((file) => file.endsWith('.sqlite')),
+      files.join(', '),
+    )
     server = await start(config)
     const reopened = await tasks(bob)
     assert.equal(reopened.size, 4)
@@ -312,7 +328,9 @@ describe('Board in a Cloudflare Durable Object', { timeout: 120_000 }, () => {
     const held = rejected(await bob<Claimed>('claim', 't', { leaseMs: 5_000 }), 'Held')
     assert.equal(held.claim, first.claim)
 
-    await new Promise((resolve) => setTimeout(resolve, Math.max(0, first.untilMs - Date.now()) + 300))
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.max(0, first.untilMs - Date.now()) + 300),
+    )
     await bob('refresh')
     assert.equal((await tasks(bob)).get('t')!.stage, 'lapsed')
     const second = ok(await bob<Claimed>('claim', 't', { leaseMs: 60_000 }))

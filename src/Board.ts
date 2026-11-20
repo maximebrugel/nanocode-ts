@@ -117,7 +117,10 @@ export type Lease = {
 
 export type Can = 'read' | 'post' | 'react' | 'label' | 'sync' | 'rank' | 'manage' | 'plan'
 
-export type Who = { kind: 'principal'; id: string } | { kind: 'kind'; id: string } | { kind: 'everyone' }
+export type Who =
+  | { kind: 'principal'; id: string }
+  | { kind: 'kind'; id: string }
+  | { kind: 'everyone' }
 
 export type Grant = { who: Who[]; can: Record<string, Can[]> }
 
@@ -191,7 +194,9 @@ export async function open(options: Options): Promise<Board> {
       const chartered = await opened.charter()
       if (!chartered.ok && chartered.rejection.kind !== 'Exists') {
         await opened.close()
-        throw new Error('could not charter ' + options.scope + ': ' + JSON.stringify(chartered.rejection))
+        throw new Error(
+          'could not charter ' + options.scope + ': ' + JSON.stringify(chartered.rejection),
+        )
       }
     }
     return opened
@@ -233,14 +238,17 @@ export async function memorySql(): Promise<MemorySql> {
     return statement
   }
   const all = (statements: Contracts.Statement[]) =>
-    statements.map(([query, ...values]) =>
-      prepare(query)
-        .all(
-          ...values.map((value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value)),
-        )
-        .map((row) =>
-          Array.isArray(row) ? row : Object.values(row as Record<string, Contracts.SqlValue>),
-        ) as Contracts.SqlValue[][],
+    statements.map(
+      ([query, ...values]) =>
+        prepare(query)
+          .all(
+            ...values.map((value) =>
+              value instanceof ArrayBuffer ? new Uint8Array(value) : value,
+            ),
+          )
+          .map((row) =>
+            Array.isArray(row) ? row : Object.values(row as Record<string, Contracts.SqlValue>),
+          ) as Contracts.SqlValue[][],
     )
   return {
     transaction(_kind, _operation, statements, access = 'write') {

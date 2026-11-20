@@ -1563,7 +1563,7 @@ export function create<E extends Env>(options: create.Options<E>): create.Return
           object_id: this.ctx.id.toString(),
           method: request.method,
           operation,
-          error: error instanceof Error ? error.stack ?? error.message : String(error),
+          error: error instanceof Error ? (error.stack ?? error.message) : String(error),
         })
         return json({ error: 'session operation failed' }, 503)
       }

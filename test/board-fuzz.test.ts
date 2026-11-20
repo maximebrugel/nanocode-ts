@@ -7,8 +7,9 @@ import * as path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import * as util from 'node:util'
-import { Board, Sql } from 'nanocode-ts/node'
-import { generator, lanes, partitionOf, type Placed, placer } from './board-fuzz.shared.ts'
+import { Board } from 'nanocode-ts/node'
+import { Sql as Postgres } from 'nanocode-ts/postgres'
+import { generator, lanes, openSql, partitionOf, type Placed, placer } from './board-fuzz.shared.ts'
 
 type Entry = {
   body?: string
@@ -63,7 +64,9 @@ type History = {
 // Four processes (board-fuzz.child.ts) write one SQLite board at random for FUZZ_MS (18 s by
 // default; set it higher for a long run), some SIGKILLed and restarted, then a fresh handle checks
 // the invariants against their journals. FUZZ_SEED fixes the random choices (timing still varies);
-// a failure prints it.
+// a failure prints it. With NC_BOARD_POSTGRES set to a database URL (board-fuzz-postgres.test.ts
+// sets it from DATABASE_URL) the board is one Postgres schema per seed instead, each process on its
+// own connection pool, and the schema is dropped once the seed passes.
 const seed = process.env.FUZZ_SEED ? Number(process.env.FUZZ_SEED) : crypto.randomInt(2 ** 31)
 const runMs = process.env.FUZZ_MS ? Number(process.env.FUZZ_MS) : 18_000
 const partitions = process.env.FUZZ_PARTITIONS
@@ -72,6 +75,7 @@ const partitions = process.env.FUZZ_PARTITIONS
     ? 1
     : 4
 const children = 4
+const postgres = process.env.NC_BOARD_POSTGRES
 const scope = 'fuzz'
 const script = fileURLToPath(new URL('./board-fuzz.child.ts', import.meta.url))
 
@@ -596,16 +600,18 @@ test('the fuzz checker flags broken histories', () => {
 test(
   'Board fuzz: ' +
     children +
-    ' processes on one SQLite file, ' +
+    (postgres ? ' processes on one Postgres schema, ' : ' processes on one SQLite file, ') +
     partitions +
     ' partitions, FUZZ_SEED=' +
     seed,
   { timeout: runMs + 120_000 },
   async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-fuzz-'))
-    const file = path.join(dir, 'board.sqlite')
+    const file = postgres
+      ? 'nc_board_fuzz_' + seed + '_' + process.pid + '_' + Date.now().toString(36)
+      : path.join(dir, 'board.sqlite')
     const random = generator(seed)
-    const sql = Sql.open(file)
+    const sql = openSql(file)
     const live = await Board.open({ sql, scope, actor: 'agent:checker', partitions })
     let passed = false
     try {
@@ -668,7 +674,7 @@ test(
       const atMs = Date.now()
       await live.refresh()
       const liveTasks = (await live.tasks(atMs)).toSorted((a, b) => a.id.localeCompare(b.id))
-      const replaySql = Sql.open(file)
+      const replaySql = openSql(file)
       const replay = await Board.open({
         sql: replaySql,
         scope,
@@ -766,7 +772,7 @@ test(
         passed = true
       } finally {
         await replay.close()
-        replaySql.close()
+        await replaySql.close()
       }
     } catch (error) {
       throw new Error(
@@ -778,13 +784,27 @@ test(
           partitions +
           ' failed; journals and board kept in ' +
           dir +
+          (postgres ? ' and Postgres schema ' + file : '') +
           '\n' +
           String((error as Error)?.stack ?? error),
       )
     } finally {
       await live.close()
-      sql.close()
+      await sql.close()
       if (passed) fs.rmSync(dir, { recursive: true, force: true })
+      if (passed && postgres) {
+        const admin = Postgres.open(postgres)
+        try {
+          await admin.transaction(
+            'log',
+            'drop',
+            [['DROP SCHEMA IF EXISTS ' + file + ' CASCADE']],
+            'schema',
+          )
+        } finally {
+          await admin.close()
+        }
+      }
     }
   },
 )

@@ -1,6 +1,14 @@
 import * as fs from 'node:fs'
-import { Board, Sql } from 'nanocode-ts/node'
-import { generator, type Lane, lanes, type Placed, placer, projects } from './board-fuzz.shared.ts'
+import { Board } from 'nanocode-ts/node'
+import {
+  generator,
+  type Lane,
+  lanes,
+  openSql,
+  type Placed,
+  placer,
+  projects,
+} from './board-fuzz.shared.ts'
 
 type Config = {
   child: number
@@ -19,7 +27,7 @@ type Held = { claim: string; id: string }
 const config = JSON.parse(process.argv[2]!) as Config
 const actor = 'agent:c' + config.child
 const random = generator(config.seed)
-const sql = Sql.open(config.path)
+const sql = openSql(config.path)
 const board = await Board.open({ sql, scope: config.scope, actor, partitions: config.partitions })
 const held = new Map<string, Held>()
 const placed = new Map<string, Placed>()
@@ -319,7 +327,7 @@ function poolCap(lane: Lane | 'pool', poolRandom: () => number): Board.PoolOptio
 
 async function startPool() {
   const poolRandom = generator(config.seed ^ 0x5bd1e995)
-  const poolSql = Sql.open(config.path)
+  const poolSql = openSql(config.path)
   const poolBoard = await Board.open({
     sql: poolSql,
     scope: config.scope,
@@ -388,7 +396,7 @@ async function startPool() {
       await pool.stop()
       record({ kind: 'pool-stats', stats: pool.stats() })
       await poolBoard.close()
-      poolSql.close()
+      await poolSql.close()
     },
   }
 }
@@ -410,9 +418,11 @@ try {
   }
   await pool?.stop()
   await board.close()
-  sql.close()
+  await sql.close()
   record({ kind: 'end' })
 } catch (error) {
-  record({ kind: 'error', message: String((error as Error)?.stack ?? error) })
-  process.exitCode = 1
+  const message = String((error as Error)?.stack ?? error)
+  record({ kind: 'error', message })
+  process.stderr.write(message + '\n')
+  process.exit(1)
 }

@@ -1,3 +1,11 @@
+import { Sql } from 'nanocode-ts/node'
+import { Sql as Postgres } from 'nanocode-ts/postgres'
+
+export function openSql(file: string) {
+  const url = process.env.NC_BOARD_POSTGRES
+  return url ? Postgres.open(url, { schema: file }) : Sql.open(file)
+}
+
 export function generator(seed: number) {
   let state = seed >>> 0
   return () => {

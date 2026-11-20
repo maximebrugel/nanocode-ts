@@ -53,7 +53,9 @@ describe('jq offsets in code points', () => {
 describe('yq', () => {
   test('match after one emoji', async () => {
     assert.equal(
-      await run(`printf 'name: "😀a"\\n' | yq -o json -I 0 '.name | match("a") | [.offset, .length]'`),
+      await run(
+        `printf 'name: "😀a"\\n' | yq -o json -I 0 '.name | match("a") | [.offset, .length]'`,
+      ),
       '[1,1]\n',
     )
   })

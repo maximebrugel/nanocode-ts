@@ -10,7 +10,9 @@
 // Every run ends with an audit of the log: every task finished exactly once.
 //
 // npm run bench:board-do [-- --clients 1,4,16 --modes one,actors --swarms 120
-//   --sizes 1000,2500,5000,10000,25000,50000 --restarts 5 --phases load,replay]
+//   --sizes 1000,2500,5000,10000,25000,50000 --restarts 5 --phases load,replay --checkpoints on,off]
+// --checkpoints on wakes from the board's fold checkpoints; off drops them before every restart
+// and opens with checkpointEvery 0, so each wake replays the whole log.
 // Needs dist/ (npm run build:ts and the board WASM), like the test.
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import {
@@ -42,6 +44,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 type Mode = 'one' | 'actors'
 
 type Config = {
+  checkpoints: ('on' | 'off')[]
   children: number
   clients: number[]
   keep: boolean
@@ -80,7 +83,11 @@ function parse(argv: readonly string[]): Config {
   const modes = (flags.get('modes') ?? 'one,actors').split(',')
   for (const mode of modes)
     if (mode !== 'one' && mode !== 'actors') throw new Error('--modes takes one and actors')
+  const checkpoints = (flags.get('checkpoints') ?? 'on,off').split(',')
+  for (const value of checkpoints)
+    if (value !== 'on' && value !== 'off') throw new Error('--checkpoints takes on and off')
   return {
+    checkpoints: checkpoints as ('on' | 'off')[],
     children: number('children', 20),
     clients: list('clients', '1,4,16'),
     keep: flags.get('keep') === 'true',
@@ -481,110 +488,134 @@ async function replay(config: Config) {
       audit = (await send<Audit>(object, { method: 'audit' })).value
     }
     const fillMs = performance.now() - fillStarted
-    const wake = { abort: [] as number[], boot: [] as number[], open: [] as number[] }
-    const steps = {
-      claimInside: [] as number[],
-      first: [] as number[],
-      firstInside: [] as number[],
-      readSql: [] as number[],
-      readyInside: [] as number[],
-      openInside: [] as number[],
-      warm: [] as number[],
-      write: [] as number[],
-      total: [] as number[],
+    for (const checkpoints of config.checkpoints) {
+      const checkpointEvery = checkpoints === 'off' ? 0 : undefined
+      if (checkpoints === 'on') {
+        // One uncounted wake with checkpoints on, so a run after an off pass (which dropped them
+        // and saved none) starts from a checkpoint as a live object would.
+        await restart(object)
+        await send(object, { method: 'open' })
+      }
+      let opened: unknown = null
+      const wake = { abort: [] as number[], boot: [] as number[], open: [] as number[] }
+      const steps = {
+        claimInside: [] as number[],
+        first: [] as number[],
+        firstInside: [] as number[],
+        readSql: [] as number[],
+        readyInside: [] as number[],
+        openInside: [] as number[],
+        warm: [] as number[],
+        write: [] as number[],
+        total: [] as number[],
+      }
+      let tasks = 0
+      for (let index = 0; index < config.restarts; index++) {
+        if (checkpoints === 'off') await send(object, { method: 'drop_checkpoints' })
+        const restarted = await restart(object)
+        wake.abort.push(restarted.abortMs)
+        wake.boot.push(restarted.bootMs)
+        const t0 = performance.now()
+        const open = await send<{ openMs: number; opened: unknown }>(object, {
+          method: 'open',
+          checkpointEvery,
+        })
+        wake.open.push(open.wallMs)
+        steps.openInside.push(open.value.openMs)
+        opened = open.value.opened
+        // The new instance's SQL time so far is the open's log read; the rest of the open is the fold.
+        const read = (await send<Operations>(object, { method: 'operations' })).value
+        steps.readSql.push(Object.values(read).reduce((sum, entry) => sum + entry.ms, 0))
+        const first = await send<{ count: number; tasksMs: number }>(object, { method: 'tasks' })
+        steps.first.push(first.wallMs)
+        steps.firstInside.push(first.value.tasksMs)
+        tasks = first.value.count
+        const warm = await send<{ count: number; tasksMs: number }>(object, { method: 'tasks' })
+        steps.warm.push(warm.wallMs)
+        // A first write after the wake: post one task, claim it, finish it.
+        const w0 = performance.now()
+        const id = 'w' + size + '-' + index
+        await send(object, { method: 'post', tasks: [{ id, labels: {}, needs: [], spec: 'wake' }] })
+        const claimed = await send<Claim>(object, {
+          client: 'lead',
+          leaseMs: config.leaseMs,
+          method: 'claim',
+        })
+        if (claimed.value.id !== id) throw new Error('the wake claim took ' + claimed.value.id)
+        steps.readyInside.push(claimed.value.readyMs ?? 0)
+        steps.claimInside.push(claimed.ms)
+        const finished = await send<{ ok: boolean; rejection?: string }>(object, {
+          claim: claimed.value.claim,
+          client: 'lead',
+          id,
+          method: 'finish',
+        })
+        if (!finished.value.ok) throw new Error('the wake finish: ' + finished.value.rejection)
+        steps.write.push(performance.now() - w0)
+        steps.total.push(performance.now() - t0)
+      }
+      audit = (await send<Audit>(object, { method: 'audit' })).value
+      const disk = diskBytes(storage) - diskBefore
+      const point = {
+        checkpoints,
+        opened,
+        bodyBytes: audit.bodyBytes,
+        databaseSize: audit.databaseSize,
+        diskBytes: disk,
+        events: audit.events,
+        fillMs: round(fillMs, 0),
+        bytesPer1kEvents: Math.round((1000 * audit.databaseSize) / audit.events),
+        logBytesPer1kEvents: Math.round((1000 * audit.bodyBytes) / audit.events),
+        ops: audit.ops,
+        rows: audit.rows,
+        size,
+        tasks,
+        violationCount: audit.violationCount,
+        violations: audit.violations,
+        wake: {
+          abortMs: round(median(wake.abort)),
+          bootMs: round(median(wake.boot)),
+          firstReadInsideMs: round(median(steps.firstInside)),
+          firstReadMs: round(median(steps.first)),
+          openInsideMs: round(median(steps.openInside)),
+          openReadSqlMs: round(median(steps.readSql)),
+          wakeClaimInsideMs: round(median(steps.claimInside)),
+          wakeReadyInsideMs: round(median(steps.readyInside)),
+          openMs: round(median(wake.open)),
+          openSamples: wake.open.map((ms) => round(ms, 1)),
+          totalMs: round(median(steps.total)),
+          warmReadMs: round(median(steps.warm)),
+          writeMs: round(median(steps.write)),
+        },
+      }
+      console.log('REPLAY ' + JSON.stringify(point))
+      points.push(point)
     }
-    let tasks = 0
-    for (let index = 0; index < config.restarts; index++) {
-      const restarted = await restart(object)
-      wake.abort.push(restarted.abortMs)
-      wake.boot.push(restarted.bootMs)
-      const t0 = performance.now()
-      const opened = await send<{ openMs: number }>(object, { method: 'open' })
-      wake.open.push(opened.wallMs)
-      steps.openInside.push(opened.value.openMs)
-      // The new instance's SQL time so far is the open's log read; the rest of the open is the fold.
-      const read = (await send<Operations>(object, { method: 'operations' })).value
-      steps.readSql.push(Object.values(read).reduce((sum, entry) => sum + entry.ms, 0))
-      const first = await send<{ count: number; tasksMs: number }>(object, { method: 'tasks' })
-      steps.first.push(first.wallMs)
-      steps.firstInside.push(first.value.tasksMs)
-      tasks = first.value.count
-      const warm = await send<{ count: number; tasksMs: number }>(object, { method: 'tasks' })
-      steps.warm.push(warm.wallMs)
-      // A first write after the wake: post one task, claim it, finish it.
-      const w0 = performance.now()
-      const id = 'w' + size + '-' + index
-      await send(object, { method: 'post', tasks: [{ id, labels: {}, needs: [], spec: 'wake' }] })
-      const claimed = await send<Claim>(object, {
-        client: 'lead',
-        leaseMs: config.leaseMs,
-        method: 'claim',
-      })
-      if (claimed.value.id !== id) throw new Error('the wake claim took ' + claimed.value.id)
-      steps.readyInside.push(claimed.value.readyMs ?? 0)
-      steps.claimInside.push(claimed.ms)
-      const finished = await send<{ ok: boolean; rejection?: string }>(object, {
-        claim: claimed.value.claim,
-        client: 'lead',
-        id,
-        method: 'finish',
-      })
-      if (!finished.value.ok) throw new Error('the wake finish: ' + finished.value.rejection)
-      steps.write.push(performance.now() - w0)
-      steps.total.push(performance.now() - t0)
-    }
-    audit = (await send<Audit>(object, { method: 'audit' })).value
-    const disk = diskBytes(storage) - diskBefore
-    const point = {
-      bodyBytes: audit.bodyBytes,
-      databaseSize: audit.databaseSize,
-      diskBytes: disk,
-      events: audit.events,
-      fillMs: round(fillMs, 0),
-      bytesPer1kEvents: Math.round((1000 * audit.databaseSize) / audit.events),
-      logBytesPer1kEvents: Math.round((1000 * audit.bodyBytes) / audit.events),
-      ops: audit.ops,
-      rows: audit.rows,
-      size,
-      tasks,
-      violationCount: audit.violationCount,
-      violations: audit.violations,
-      wake: {
-        abortMs: round(median(wake.abort)),
-        bootMs: round(median(wake.boot)),
-        firstReadInsideMs: round(median(steps.firstInside)),
-        firstReadMs: round(median(steps.first)),
-        openInsideMs: round(median(steps.openInside)),
-        openReadSqlMs: round(median(steps.readSql)),
-        wakeClaimInsideMs: round(median(steps.claimInside)),
-        wakeReadyInsideMs: round(median(steps.readyInside)),
-        openMs: round(median(wake.open)),
-        openSamples: wake.open.map((ms) => round(ms, 1)),
-        totalMs: round(median(steps.total)),
-        warmReadMs: round(median(steps.warm)),
-        writeMs: round(median(steps.write)),
-      },
-    }
-    console.log('REPLAY ' + JSON.stringify(point))
-    points.push(point)
   }
   // Replay cost against log size: ms per 1k events at each point, and the growth between points
   // relative to the growth in events (1.0 is linear).
-  const growth = points.slice(1).map((point, index) => {
-    const before = points[index]!
+  const growth = points.flatMap((point, index) => {
+    const before = points
+      .slice(0, index)
+      .reverse()
+      .find((one) => one.checkpoints === point.checkpoints)
+    if (!before) return []
     const events = point.events / before.events
     const ratio = (pick: (p: typeof point) => number | null) => {
       const a = pick(before)
       const b = pick(point)
       return a && b ? round(b / a / events) : null
     }
-    return {
-      from: before.size,
-      to: point.size,
-      open: ratio((p) => p.wake.openMs),
-      firstRead: ratio((p) => p.wake.firstReadMs),
-      total: ratio((p) => p.wake.totalMs),
-    }
+    return [
+      {
+        checkpoints: point.checkpoints,
+        from: before.size,
+        to: point.size,
+        open: ratio((p) => p.wake.openMs),
+        firstRead: ratio((p) => p.wake.firstReadMs),
+        total: ratio((p) => p.wake.totalMs),
+      },
+    ]
   })
   return { growth, points, written }
 }

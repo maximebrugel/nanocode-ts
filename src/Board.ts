@@ -131,6 +131,9 @@ export type Options = {
   partitions?: number
   module?: WebAssembly.Module
   charter?: boolean
+  // Events a partition folds past its last fold checkpoint before it saves another (4096 by
+  // default); 0 saves none on its own, though checkpoint() and close() still save one.
+  checkpointEvery?: number
 }
 
 export type MemorySql = Contracts.SqlHost & { close(): void }
@@ -203,7 +206,14 @@ export async function open(options: Options): Promise<Board> {
   const runtime = await AgentRuntime.instantiate(module, options.sql, { published() {} })
   try {
     const board = (await runtime.board({
-      open: { scope: options.scope, actor: options.actor, partitions: options.partitions ?? 1 },
+      open: {
+        scope: options.scope,
+        actor: options.actor,
+        partitions: options.partitions ?? 1,
+        ...(options.checkpointEvery === undefined
+          ? {}
+          : { checkpoint_every: options.checkpointEvery }),
+      },
     })) as number
     const opened = wrap(runtime, board, options)
     if ((options.charter ?? true) && !options.actor.includes('+')) {

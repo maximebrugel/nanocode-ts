@@ -26,6 +26,7 @@ type Call = {
   seed?: number
   children?: number
   prefix?: string
+  checkpointEvery?: number
 }
 
 type Operation = { count: number; ms: number; errors: number }
@@ -131,11 +132,17 @@ export class BoardObject extends DurableObject<Env> {
 
   // One handle for the whole object (mode one, as a swarm's object holds its board), or one per
   // client actor (mode actors, as test/board-cloudflare.test.ts does), each with its own fold.
-  board(who: string): Promise<Board.Board> {
+  board(who: string, checkpointEvery?: number): Promise<Board.Board> {
     const actor = this.mode === 'one' ? lead : who
     let opened = this.boards.get(actor)
     if (!opened) {
-      opened = Board.open({ sql: this.host(), scope, actor: 'agent:' + actor, module: wasm })
+      opened = Board.open({
+        sql: this.host(),
+        scope,
+        actor: 'agent:' + actor,
+        module: wasm,
+        ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
+      })
       opened.catch(() => this.boards.delete(actor))
       this.boards.set(actor, opened)
     }
@@ -309,11 +316,16 @@ export class BoardObject extends DurableObject<Env> {
         return { mode: this.mode }
       }
       case 'open': {
-        // The first board call after a restart: Board.open over the stored log.
+        // The first board call after a restart: Board.open over the stored log, from its newest
+        // fold checkpoint unless the bench dropped them.
         const t0 = performance.now()
-        await this.board(lead)
-        return { openMs: performance.now() - t0 }
+        const board = await this.board(lead, call.checkpointEvery)
+        const openMs = performance.now() - t0
+        return { openMs, opened: await board.opened() }
       }
+      case 'drop_checkpoints':
+        this.ctx.storage.sql.exec('DELETE FROM nanocode_checkpoint')
+        return null
       case 'tasks': {
         const board = await this.board(lead)
         const t0 = performance.now()

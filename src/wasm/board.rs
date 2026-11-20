@@ -37,6 +37,10 @@ pub(crate) enum Request {
         actor: String,
         partitions: NonZeroU32,
         scope: String,
+        /// Events a partition folds past its last checkpoint before it saves another; 0 saves
+        /// none on its own. Unset keeps nanocode's default.
+        #[serde(default)]
+        checkpoint_every: Option<u64>,
     },
     Opened {
         board: u32,
@@ -116,7 +120,14 @@ pub(crate) async fn execute(request: Request) -> Result<Value, String> {
             actor,
             partitions,
             scope,
-        } => open(&scope, &actor, partitions).await,
+            checkpoint_every,
+        } => {
+            // Each Board.open instantiates its own module, so this setting is this board's.
+            if let Some(events) = checkpoint_every {
+                nanocode_board::checkpoint::checkpoint_every(events);
+            }
+            open(&scope, &actor, partitions).await
+        }
         Request::Opened { board } => BOARDS.with_borrow(|boards| {
             let boards = boards
                 .get(&board)

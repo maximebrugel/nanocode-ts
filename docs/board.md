@@ -6,9 +6,9 @@ A write the board refuses does not throw. It returns `{ ok: false, rejection }`,
 
 ## Open a board
 
-`Board.open({ sql, scope, actor, partitions?, module?, charter? })` opens one handle over a `SqlHost`. `scope` names the board and `actor` is who writes (`agent:lead`), so give each worker its own handle. A handle charters the scope when it opens (`charter: false` skips that). The handle that chartered it can let others in with `grant`, as the example does for every `agent:` actor.
+`Board.open({ sql, scope, actor, partitions?, module?, charter? })` opens one handle over a `SqlHost`. `scope` names the board and `actor` is who writes (`agent:lead`), so give each worker its own handle. A handle charters the scope when it opens (`charter: false` skips that) and can let others in with `grant`.
 
-Node, a SQLite file that several processes can share (needs `node:sqlite`, Node 22.5+):
+Node, a SQLite file several processes can share (needs `node:sqlite`, Node 22.5+):
 
 ```ts
 import { Board, Sql } from 'nanocode-ts/node'
@@ -32,7 +32,22 @@ const board = await Board.open({
 })
 ```
 
-For tests, `await Board.memorySql()` is an in-memory host (Node only). Share one host between handles to share a board. `board.close()` closes a handle, and `sql.close()` closes the Node or memory host.
+Postgres, so workers on several machines share one board (needs the optional peer dependency `postgres`):
+
+```ts
+import { Board, Sql } from 'nanocode-ts/postgres'
+
+const sql = Sql.open(process.env.DATABASE_URL!, { schema: 'board', max: 2 })
+const board = await Board.open({ sql, scope: 'demo', actor: 'agent:lead' })
+```
+
+`Sql.open(url, { schema?, max?, valueLimit? })` opens a connection pool. `schema` runs every statement in that schema and creates it if missing, `max` is the pool size and `valueLimit` caps a stored value. It also exports `Board`.
+
+For tests, `await Board.memorySql()` is an in-memory host (Node only). Share one host between handles to share a board. `board.close()` closes a handle, and `sql.close()` closes the Node, memory or Postgres host.
+
+### Choosing a backend
+
+On one host, SQLite is faster. Postgres writes take 0.36 ms (p50) against SQLite's 0.05 ms, so workers lose more append races. Measured with 8 workers on one partition, Postgres on loopback: 669 claims/s on SQLite and 454 on Postgres (task p99 519 and 1,275 ms; [DECISIONS.md](../DECISIONS.md), 'Board on Postgres'). Use Postgres when workers run on different machines. There partitions help: 8 partitions take it from 454 to 524 claims/s. On one SQLite file they cost throughput: [bench/RESULTS.md](../bench/RESULTS.md) shows 773, 742 and 625 claims/s at 1, 4 and 8 partitions with 8 workers.
 
 ## Post
 
@@ -106,37 +121,17 @@ const pool = Board.pool(board, {
 })
 ```
 
-`label: [key, value]` limits the pool to tasks with that label, and `idleMs` retires it after that long with nothing to do. `lease` has `signal`, `tookOver`, `steers()` and `heed(seq)`. A run that did not heed its steers still finishes: the pool heeds the last one and retries. `pool.idle()` waits for a poll that finds nothing running or ready, `pool.stats()` counts `claimed`, `done`, `failed`, `lost`, `released`, `delivered`, `unheard`, `retries` and `errors`, and `pool.stop()` aborts the runs and releases their claims. The pool claims without a `cap`.
+`label: [key, value]` limits the pool to tasks with that label, and `idleMs` retires it after that long with nothing to do. `lease` has `signal`, `tookOver`, `steers()` and `heed(seq)`. A run that did not heed its steers still finishes: the pool heeds the last one and retries. `pool.idle()` waits for a poll that finds nothing running or ready, `pool.stats()` counts `claimed`, `done`, `failed`, `lost`, `released`, `delivered`, `unheard`, `retries` and `errors`, and `pool.stop()` aborts the runs and releases their claims. `cap` is a number, a `{ max, label }` cap, or a function from the task to one (or `undefined`), and the pool claims each task under it. A label cap applies only to tasks that carry that label. A refused claim is skipped.
 
 ## Partitions
 
-`partitions: 4` splits the log into 4 (the default is 1). A task lives in one partition: its `thread` or else `project` label picks it, a child follows its parent, and otherwise its id does. `needs` resolve inside the task's partition, so a need on a task in another partition is `UnknownNeed`. Give tasks that depend on each other a shared `project` label or a parent. A move between partitions is not supported.
+`partitions: 4` splits the log into 4 (the default is 1). A task lives in one partition: its `thread` or else `project` label picks it, a child follows its parent, and otherwise its id does. `needs` resolve inside the task's partition, so a need on a task in another partition is `UnknownNeed`. Give tasks that depend on each other a shared `project` label or a parent. A task cannot move between partitions.
 
-## Example
+## Examples
 
-[examples/board-pool](../examples/board-pool/index.ts) has a lead post a four-task graph while two `Board.pool` workers drain it on one SQLite file, with one steer. Run it with `npm run example:board-pool`. This output is from Node 26:
+Run each with `npm run example:<name>` after `npm install`. The [board-pool](../examples/board-pool/index.ts) lead posts a four-task graph while two `Board.pool` workers drain it on one SQLite file, with one steer. The others add:
 
-```text
-+  87ms  lead  post   plan
-+  88ms  lead  post   fetch-a
-+  89ms  lead  post   fetch-b
-+  89ms  lead  post   summarize
-+ 106ms  w1    start  plan
-+ 256ms  w1    done   plan
-+ 258ms  w1    start  fetch-a
-+ 274ms  w2    start  fetch-b
-+ 409ms  w1    done   fetch-a
-+ 424ms  w2    done   fetch-b
-+ 425ms  w2    start  summarize
-+ 438ms  lead  steer  summarize
-+ 827ms  w2    steer  summarize: keep it to two lines
-+ 828ms  w2    done   summarize
-+ 829ms  lead  result fetch-a: {"done":"w1 finished fetch-a"}
-+ 829ms  lead  result fetch-b: {"done":"w2 finished fetch-b"}
-+ 829ms  lead  result plan: {"done":"w1 finished plan"}
-+ 829ms  lead  result summarize: {"done":"w2 finished summarize"}
-w1 {"state":"stopped","running":0,"claimed":2,"done":2,"failed":0,"lost":0,"released":0,"delivered":0,"unheard":0,"retries":0,"polls":37,"errors":0}
-w2 {"state":"stopped","running":0,"claimed":2,"done":2,"failed":0,"lost":0,"released":0,"delivered":1,"unheard":0,"retries":0,"polls":37,"errors":0}
-```
+- [board-agents](../examples/board-agents/README.md): two pools run a six-task graph with `cap: { max: 2, label: ['kind', 'agent'] }` and prints each task's `Task.worker`.
+- [board-durable-object](../examples/board-durable-object/README.md): a Worker whose Durable Object holds a `Board` over `Sql.create(ctx.storage)`, served by workerd, with a takeover and a label cap.
+- [board-postgres](../examples/board-postgres/README.md): a lead and three worker processes share one board over Postgres with `nanocode-ts/postgres`. A killed worker's task is taken over once its lease lapses. It needs `DATABASE_URL`.
 
-`w1` and `w2` split the two fetches once `plan` is done, `summarize` waits for both, and the lead's steer arrives while `w2` holds it. `w2` reads it, heeds it and finishes.

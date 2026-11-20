@@ -175,7 +175,7 @@ export type Board = {
 }
 
 export async function open(options: Options): Promise<Board> {
-  const module = options.module ?? (await (await import('./vercel/Wasm.ts')).load())
+  const module = options.module ?? (await bundled())
   const runtime = await AgentRuntime.instantiate(module, options.sql, { published() {} })
   try {
     const board = (await runtime.board({
@@ -194,6 +194,12 @@ export async function open(options: Options): Promise<Board> {
     await runtime.dispose()
     throw error
   }
+}
+
+async function bundled(): Promise<WebAssembly.Module> {
+  const specifier = './vercel/Wasm.js'
+  const wasm = (await import(specifier)) as { load(): Promise<WebAssembly.Module> }
+  return wasm.load()
 }
 
 type Sqlite = {

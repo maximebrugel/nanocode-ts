@@ -424,16 +424,12 @@ function check({ entries, tasks, steers, unjournaled, killedRuns, partitions }: 
         violations.push(
           id + ' still holds steer ' + steer.seq + ' after a heed up to ' + heeded.get(id),
         )
-      if (bodies.has(steer.body))
+      const body = where({ id } as Entry) + '/' + steer.body
+      if (bodies.has(body))
         violations.push(
-          'steer ' +
-            steer.body +
-            ' is pending twice: ' +
-            bodies.get(steer.body) +
-            ' and ' +
-            steer.seq,
+          'steer ' + body + ' is pending twice: ' + bodies.get(body) + ' and ' + steer.seq,
         )
-      bodies.set(steer.body, steer.seq)
+      bodies.set(body, steer.seq)
     }
   }
   for (const sent of of('steer')) {

@@ -8,6 +8,7 @@ type Role = {
   partitions: number
   where: { sql: 'sqlite'; path: string } | { sql: 'postgres'; url: string; schema: string }
   pollMs: number
+  wake: boolean
   scope: string
   seed: number
   workMaxMs: number
@@ -64,10 +65,10 @@ const metrics = {
 }
 
 const where = role.where
+const postgres =
+  where.sql === 'postgres' ? Postgres.open(where.url, { schema: where.schema, max: 2 }) : undefined
 const host: Board.Options['sql'] & { close(): unknown } =
-  where.sql === 'sqlite'
-    ? Sql.open(where.path)
-    : Postgres.open(where.url, { schema: where.schema, max: 2 })
+  where.sql === 'sqlite' ? Sql.open(where.path) : postgres!
 
 const failed = (error: unknown) => {
   const type = classify(error)
@@ -156,6 +157,7 @@ const pool = Board.pool(observed, {
   concurrency: role.concurrency,
   leaseMs: role.leaseMs,
   pollMs: role.pollMs,
+  wake: role.wake && postgres ? Postgres.wake(postgres) : undefined,
   async run(_task, lease) {
     await sleep(role.workMinMs + draw() * (role.workMaxMs - role.workMinMs))
     const steers = await lease.steers()

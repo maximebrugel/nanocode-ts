@@ -16,6 +16,12 @@ export type PoolOptions = {
   pollMs: number
   idleMs?: number | undefined
   run: (task: Board.Task, lease: PoolLease) => Promise<Board.Outcome>
+  /**
+   * Subscribes to new work on the board: the pool polls as soon as notify fires, and still every
+   * pollMs as a fallback. Returns the unsubscribe the pool calls when it stops or retires. Postgres
+   * hosts give one with nanocode-ts/postgres Sql.wake; node:sqlite has none and keeps polling.
+   */
+  wake?: ((notify: () => void) => () => void) | undefined
 }
 
 export type PoolState = 'running' | 'stopping' | 'stopped' | 'retired'
@@ -328,6 +334,7 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
     if (stopping) return stopping
     stats.state = 'stopping'
     unschedule()
+    unwake?.()
     stopping = (async () => {
       await ticking
       const held = [...running.values()].filter((worker) => worker.state.phase === 'running')
@@ -352,6 +359,11 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
     })()
     return stopping
   }
+
+  // A full pool ignores wakes: a run that ends polls anyway.
+  const unwake = options.wake?.(() => {
+    if (running.size < concurrency) kick()
+  })
 
   kick()
 

@@ -89,6 +89,13 @@ export function translate(query: string): string {
 
 const schemaLock = "SELECT pg_advisory_xact_lock(hashtext('nanocode-ts/postgres schema'))"
 
+/** The channel a host notifies, with its schema as the payload, after it commits a log write. */
+export const channel = 'nanocode_log'
+
+const logWrite = /^\s*(?:INSERT|UPDATE|DELETE)\b[^;]*\bnanocode_log\b/i
+
+const connections = new WeakMap<Host, postgres.Sql>()
+
 /**
  * Opens a pool of connections to the Postgres database at url. Writes run in READ COMMITTED
  * transactions, as nanocode's Postgres store does: the log's primary key fences appends, so a lost
@@ -128,8 +135,29 @@ export function open(url: string, options: Options = {}): Host {
     return found
   }
 
+  const payload = schema ?? ''
+  let notifying = false
+  let pending = false
+  const notify = () => {
+    if (closed) return
+    if (notifying) {
+      pending = true
+      return
+    }
+    notifying = true
+    sql`SELECT pg_notify(${channel}, ${payload})`
+      .catch(() => {})
+      .finally(() => {
+        notifying = false
+        if (pending) {
+          pending = false
+          notify()
+        }
+      })
+  }
+
   let closed = false
-  return {
+  const host: Host = {
     schema,
     ...(valueLimit === undefined ? {} : { value_limit: valueLimit }),
     async transaction(_kind, _operation, statements, access = 'write') {
@@ -148,6 +176,7 @@ export function open(url: string, options: Options = {}): Host {
         }
         return all
       })
+      if (access !== 'read' && statements.some(([query]) => logWrite.test(query))) notify()
       return results as unknown as Contracts.SqlValue[][][]
     },
     async close() {
@@ -155,6 +184,47 @@ export function open(url: string, options: Options = {}): Host {
       closed = true
       await sql.end({ timeout: 5 })
     },
+  }
+  connections.set(host, sql)
+  return host
+}
+
+export type WakeOptions = {
+  /** Notifications within this many ms of the first one wake the pool once, at its end (default 5). */
+  debounceMs?: number
+}
+
+/**
+ * A Board.pool wake for a host from open: LISTENs on the nanocode_log channel and calls notify
+ * once per burst of log writes committed by any host on the same database and schema. A lost
+ * connection is listened again and notifies once, since writes may have landed meanwhile; until
+ * then the pool's pollMs still finds work. Returns the subscribe function PoolOptions.wake takes.
+ */
+export function wake(host: Host, options: WakeOptions = {}): (notify: () => void) => () => void {
+  const sql = connections.get(host)
+  if (sql === undefined) throw new Error('wake takes a host from nanocode-ts/postgres Sql.open')
+  const debounceMs = options.debounceMs ?? 5
+  if (!Number.isFinite(debounceMs) || debounceMs < 0)
+    throw new Error('debounceMs must be a non-negative number')
+  const payload = host.schema ?? ''
+  return (notify) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let stopped = false
+    const fire = () => {
+      if (stopped || timer !== undefined) return
+      timer = setTimeout(() => {
+        timer = undefined
+        if (!stopped) notify()
+      }, debounceMs)
+    }
+    const listening = sql
+      .listen(channel, (value) => value === payload && fire(), fire)
+      .catch(() => undefined)
+    return () => {
+      stopped = true
+      if (timer !== undefined) clearTimeout(timer)
+      void listening.then((listened) => listened?.unlisten().catch(() => {}))
+    }
   }
 }
 

@@ -18,6 +18,7 @@ type Config = {
   leaseMs: number
   partitions: readonly number[]
   pollMs: number
+  wake: boolean
   postMs: number
   seed: number
   sql: 'sqlite' | 'postgres'
@@ -97,6 +98,10 @@ function parse(argv: readonly string[]): Config {
       return parsed
     })
   const inflight = flags.get('inflight')
+  const wake = flags.get('wake') ?? 'off'
+  if (wake !== 'on' && wake !== 'off') throw new Error('--wake takes on or off')
+  if (wake === 'on' && (flags.get('sql') ?? 'sqlite') !== 'postgres')
+    throw new Error('--wake on needs --sql postgres: node:sqlite has no cross-process notify')
 
   return {
     children: number('children', 20),
@@ -107,6 +112,7 @@ function parse(argv: readonly string[]): Config {
     leaseMs: number('lease-ms', 3_000),
     partitions: list('partitions', '1,4,8'),
     pollMs: number('poll-ms', 25),
+    wake: wake === 'on',
     postMs: number('post-ms', 45_000),
     seed: number('seed', 1),
     sql: backend(flags.get('sql') ?? 'sqlite'),
@@ -439,6 +445,7 @@ async function run(cell: Cell) {
       partitions: cell.partition,
       where,
       pollMs: cell.pollMs,
+      wake: cell.wake,
       scope,
       seed: cell.seed * 1_000_003 + index * 1009 + incarnation,
       workMaxMs: cell.workMaxMs,
@@ -587,6 +594,7 @@ async function run(cell: Cell) {
       leaseMs: cell.leaseMs,
       partitions: cell.partition,
       pollMs: cell.pollMs,
+      wake: cell.wake,
       workers: cell.worker,
     },
     claimRejections: rejected,

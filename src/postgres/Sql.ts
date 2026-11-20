@@ -1,3 +1,4 @@
+import * as AsyncHooks from 'node:async_hooks'
 import postgres from 'postgres'
 import type * as Contracts from '../Contracts.ts'
 
@@ -91,12 +92,26 @@ export function translate(query: string): string {
 
 const schemaLock = "SELECT pg_advisory_xact_lock(hashtext('nanocode-ts/postgres schema'))"
 
-/** The channel a host notifies, with its schema as the payload, after it commits a log write. */
+/**
+ * The channel a host notifies after it commits a log write, with its schema and its own random id
+ * as the payload ("<schema>/<id>"), so a host's wakes skip its own notifications.
+ */
 export const channel = 'nanocode_log'
+
+/**
+ * Whom a pool's own write wakes: no pool for a claim, renewal or heed, which never makes work
+ * ready, and every pool but the writer for a finish or release, since the writer polls when its
+ * run ends. A write outside own (a post, say) wakes every pool.
+ */
+export type Reach = 'none' | 'others'
 
 const logWrite = /^\s*(?:INSERT|UPDATE|DELETE)\b[^;]*\bnanocode_log\b/i
 
-const connections = new WeakMap<Host, postgres.Sql>()
+type Link = { id: string; local: Set<() => void>; sql: postgres.Sql }
+
+const links = new WeakMap<Host, Link>()
+
+const reaching = new AsyncHooks.AsyncLocalStorage<{ reach: Reach; from: () => void }>()
 
 /**
  * Opens a pool of connections to the Postgres database at url. Writes run in READ COMMITTED
@@ -141,7 +156,9 @@ export function open(url: string, options: Options = {}): Host {
   }
 
   // At most one notification per notifyMs: a burst of writes sends one at its start and one after.
-  const payload = schema ?? ''
+  const id = crypto.randomUUID()
+  const local = new Set<() => void>()
+  const payload = (schema ?? '') + '/' + id
   let notified = 0
   let notifying: ReturnType<typeof setTimeout> | undefined
   const notify = () => {
@@ -177,7 +194,14 @@ export function open(url: string, options: Options = {}): Host {
         }
         return all
       })
-      if (access !== 'read' && statements.some(([query]) => logWrite.test(query))) notify()
+      if (access !== 'read' && statements.some(([query]) => logWrite.test(query))) {
+        // Other hosts hear the notification; this host's own pools are woken here directly.
+        const own = reaching.getStore()
+        if (own?.reach !== 'none') {
+          notify()
+          for (const fire of local) if (fire !== own?.from) fire()
+        }
+      }
       return results as unknown as Contracts.SqlValue[][][]
     },
     async close() {
@@ -187,7 +211,7 @@ export function open(url: string, options: Options = {}): Host {
       await sql.end({ timeout: 5 })
     },
   }
-  connections.set(host, sql)
+  links.set(host, { id, local, sql })
   return host
 }
 
@@ -196,19 +220,26 @@ export type WakeOptions = {
   debounceMs?: number
 }
 
+/** Stops a subscription; own runs the subscriber's own write so that it wakes only reach. */
+export type Subscription = (() => void) & {
+  own<T>(reach: Reach, write: () => Promise<T>): Promise<T>
+}
+
 /**
- * A Board.pool wake for a host from open: LISTENs on the nanocode_log channel and calls notify
- * once per burst of log writes committed by any host on the same database and schema. A lost
- * connection is listened again and notifies once, since writes may have landed meanwhile; until
- * then the pool's pollMs still finds work. Returns the subscribe function PoolOptions.wake takes.
+ * A Board.pool wake for a host from open: calls notify once per burst of log writes committed on
+ * the same database and schema, by other hosts through the nanocode_log channel and by this host
+ * directly, skipping the writes own says reach nobody or only others. A lost connection is
+ * listened again and notifies once, since writes may have landed meanwhile; until then the pool's
+ * pollMs still finds work. Returns the subscribe function PoolOptions.wake takes.
  */
-export function wake(host: Host, options: WakeOptions = {}): (notify: () => void) => () => void {
-  const sql = connections.get(host)
-  if (sql === undefined) throw new Error('wake takes a host from nanocode-ts/postgres Sql.open')
+export function wake(host: Host, options: WakeOptions = {}): (notify: () => void) => Subscription {
+  const link = links.get(host)
+  if (link === undefined) throw new Error('wake takes a host from nanocode-ts/postgres Sql.open')
   const debounceMs = options.debounceMs ?? 5
   if (!Number.isFinite(debounceMs) || debounceMs < 0)
     throw new Error('debounceMs must be a non-negative number')
-  const payload = host.schema ?? ''
+  const prefix = (host.schema ?? '') + '/'
+  const self = prefix + link.id
   return (notify) => {
     let timer: ReturnType<typeof setTimeout> | undefined
     let stopped = false
@@ -219,14 +250,19 @@ export function wake(host: Host, options: WakeOptions = {}): (notify: () => void
         if (!stopped) notify()
       }, debounceMs)
     }
-    const listening = sql
-      .listen(channel, (value) => value === payload && fire(), fire)
+    link.local.add(fire)
+    const listening = link.sql
+      .listen(channel, (value) => value.startsWith(prefix) && value !== self && fire(), fire)
       .catch(() => undefined)
-    return () => {
+    const stop = () => {
       stopped = true
+      link.local.delete(fire)
       if (timer !== undefined) clearTimeout(timer)
       void listening.then((listened) => listened?.unlisten().catch(() => {}))
     }
+    return Object.assign(stop, {
+      own: <T>(reach: Reach, write: () => Promise<T>) => reaching.run({ reach, from: fire }, write),
+    })
   }
 }
 

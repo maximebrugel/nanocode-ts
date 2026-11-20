@@ -204,6 +204,49 @@ if (process.env.NC_WAKE_CHILD) {
         process.stdout.write('# poll drain ' + elapsed + ' ms\n')
         assert.ok(elapsed > pollMs / 2, 'drained in ' + elapsed + ' ms')
       })
+
+      test("a pool's own writes wake only the pools own names", async () => {
+        const schema = 'nc_board_wake_own_' + process.pid
+        schemas.push(schema)
+        const near = Sql.open(url, { schema })
+        const far = Sql.open(url, { schema })
+        const board = await Board.open({ sql: near, scope: 'own', actor: 'agent:parent' })
+        const hits = { self: 0, sibling: 0, remote: 0 }
+        const subscribe = (sql: Sql.Host, name: keyof typeof hits) =>
+          Sql.wake(sql, { debounceMs: 20 })(() => hits[name]++)
+        const self = subscribe(near, 'self')
+        const sibling = subscribe(near, 'sibling')
+        const remote = subscribe(far, 'remote')
+        // Each LISTEN taking effect notifies once.
+        while (hits.self === 0 || hits.sibling === 0 || hits.remote === 0) await sleep(5)
+        const settle = async () => {
+          await sleep(300)
+          const seen = { ...hits }
+          hits.self = hits.sibling = hits.remote = 0
+          return seen
+        }
+        await settle()
+        const post = (id: string) =>
+          board.post({ id, spec: id }).then((posted) => assert.ok(posted.ok))
+
+        await self.own('none', () => post('claim-like'))
+        assert.deepEqual(await settle(), { self: 0, sibling: 0, remote: 0 })
+
+        // The writer's own host skips its notification, so self stays quiet.
+        await self.own('others', () => post('finish-like'))
+        const others = await settle()
+        assert.equal(others.self, 0)
+        assert.ok(others.sibling > 0 && others.remote > 0, JSON.stringify(others))
+
+        await post('post')
+        const all = await settle()
+        assert.ok(all.self > 0 && all.sibling > 0 && all.remote > 0, JSON.stringify(all))
+
+        for (const stop of [self, sibling, remote]) stop()
+        await board.close()
+        await near.close()
+        await far.close()
+      })
     })
   }
 }

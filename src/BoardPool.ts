@@ -21,7 +21,16 @@ export type PoolOptions = {
    * pollMs as a fallback. Returns the unsubscribe the pool calls when it stops or retires. Postgres
    * hosts give one with nanocode-ts/postgres Sql.wake; node:sqlite has none and keeps polling.
    */
-  wake?: ((notify: () => void) => () => void) | undefined
+  wake?: ((notify: () => void) => PoolWake) | undefined
+}
+
+/**
+ * Stops a wake subscription. own, when given, runs one of the pool's own writes so that it wakes
+ * no pool (a claim, renewal or heed, which never makes work ready) or every pool but this one (a
+ * finish or release: this pool polls when a run ends anyway).
+ */
+export type PoolWake = (() => void) & {
+  own?<T>(reach: 'none' | 'others', write: () => Promise<T>): Promise<T>
 }
 
 export type PoolState = 'running' | 'stopping' | 'stopped' | 'retired'
@@ -123,6 +132,9 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
   let again = false
   let stopping: Promise<void> | undefined
 
+  const own = <T>(reach: 'none' | 'others', write: () => Promise<T>) =>
+    unwake?.own ? unwake.own(reach, write) : write()
+
   const error = (cause: unknown) => {
     stats.errors++
     stats.lastError = failure(cause)
@@ -149,7 +161,7 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
     const at = Date.now()
     let renewed: Board.Verdict
     try {
-      renewed = await board.renew(worker.task.id, worker.claim, leaseMs)
+      renewed = await own('none', () => board.renew(worker.task.id, worker.claim, leaseMs))
     } catch (cause) {
       error(cause)
       if (Date.now() >= worker.untilMs) lose(worker, unknown(cause))
@@ -172,7 +184,7 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
   const heed = async (worker: Worker, seq: number) => {
     const before = gone(worker)
     if (before) throw before
-    const heeded = await board.heed(worker.task.id, worker.claim, seq)
+    const heeded = await own('none', () => board.heed(worker.task.id, worker.claim, seq))
     if (heeded.ok) return
     if (holding(heeded.rejection.kind)) lose(worker, heeded.rejection)
     throw (
@@ -184,7 +196,9 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
   const finish = async (worker: Worker, result: Board.Outcome) => {
     for (;;) {
       if (worker.state.phase !== 'finishing') return
-      const finished = await board.finish(worker.task.id, worker.claim, result).catch(refused)
+      const finished = await own('others', () =>
+        board.finish(worker.task.id, worker.claim, result),
+      ).catch(refused)
       if (finished.ok) {
         if ('done' in result) stats.done++
         else stats.failed++
@@ -283,9 +297,8 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
           if (stats.state !== 'running' || running.size >= concurrency) break
           if (running.has(task.id)) continue
           const limit = capped(cap, task)
-          const claimed = await board.claim(
-            task.id,
-            limit === undefined ? { leaseMs } : { cap: limit, leaseMs },
+          const claimed = await own('none', () =>
+            board.claim(task.id, limit === undefined ? { leaseMs } : { cap: limit, leaseMs }),
           )
           if (!claimed.ok) continue
           stats.claimed++
@@ -346,9 +359,9 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
       await Promise.all(
         held.map(async (worker) => {
           await worker.renewing
-          const released = await board
-            .release(worker.task.id, worker.claim, 'pool stopped')
-            .catch(refused)
+          const released = await own('others', () =>
+            board.release(worker.task.id, worker.claim, 'pool stopped'),
+          ).catch(refused)
           if (released.ok) stats.released++
           else if (!holding(released.rejection.kind)) error(released.rejection)
         }),

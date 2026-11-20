@@ -116,6 +116,44 @@ committed write (0d9bb85), round B is the throttled sender that landed.
 - Cells vary by up to a third between rounds on this shared host (1 partition, 1000 ms, off: 290 and 388
   claims/s), so differences under about 15% in one round are noise.
 
+**Cheaper wake (round C).** A notification now carries `<schema>/<host id>`, and `Sql.wake` skips its own
+host's (that host's pools are woken directly). `Board.pool` runs its claims, renewals and heeds through the
+subscription's `own('none')`, which wakes no pool, and its finishes and releases through `own('others')`, which
+wakes every pool but itself, since a pool polls when a run ends anyway. Posts and writes outside a pool wake every
+pool as before; a lease that lapses writes nothing, so `pollMs` still finds it. The 5 ms debounce and the 10 ms
+send throttle stay. A notification does not name a partition: only a pool filtered on a `thread` or `project`
+label could map to one, and unfiltered pools, the bench's included, claim from all of them.
+
+Same matrix as rounds A and B, run on 2026-11-20 with three variants per round (off, the old wake at 5eb7feb, the
+new one), their order rotated each round, six rounds per cell (two runs of three, since the first three were too
+noisy to read). The host's load average ran from 40 to 212 during the runs, so each cell spans 2–20×. Medians of
+six with [min–max], zero violations in all 72 runs:
+
+| poll ms | partitions | wake | claims/s | task p99 ms | polls per claim |
+|---|---|---|---|---|---|
+| 25 | 1 | off | 203 [67–381] | 2,278 [1,294–5,494] | 0.66 |
+| 25 | 1 | old | 267 [157–416] | 2,160 [1,185–4,459] | 0.80 |
+| 25 | 1 | new | 236 [94–323] | 3,496 [1,965–6,013] | 0.71 |
+| 25 | 8 | off | 289 [67–561] | 2,715 [1,100–6,303] | 0.55 |
+| 25 | 8 | old | 316 [268–512] | 2,087 [1,023–3,449] | 0.66 |
+| 25 | 8 | new | 204 [85–428] | 3,628 [1,713–5,592] | 0.58 |
+| 1000 | 1 | off | 274 [58–398] | 2,939 [1,358–8,234] | 0.56 |
+| 1000 | 1 | old | 197 [43–346] | 3,709 [1,514–6,830] | 0.84 |
+| 1000 | 1 | new | 209 [42–327] | 3,037 [1,296–10,288] | 0.61 |
+| 1000 | 8 | off | 346 [19–418] | 2,275 [1,465–46,097] | 0.59 |
+| 1000 | 8 | old | 284 [64–469] | 2,099 [1,432–6,996] | 0.62 |
+| 1000 | 8 | new | 336 [59–438] | 2,437 [1,099–8,574] | 0.62 |
+
+- **The new wake removes most of the extra polls.** Over wake off, the old wake added 0.14, 0.11, 0.29 and 0.04
+  polls per claim (25 ms at 1 and 8 partitions, then 1000 ms at 1 and 8); the new one adds 0.05, 0.03, 0.05 and
+  0.04.
+- **Throughput and latency are not resolved on this host.** Spreads are far wider than the 15% effect being
+  measured, and the old wake against off came out +31% claims/s at 25 ms and −28% at 1000 ms on one partition,
+  so this round neither confirms nor refutes round B's cost. Paired by round, new over old claims/s has medians of
+  0.80, 0.70, 0.99 and 1.03 in the order above. At 25 ms and 8 partitions the new wake was below the old in all six
+  rounds (0.30–0.84) with a higher p99, which nothing above explains. Rerun on a quiet host before relying on
+  either direction.
+
 ## Reproduce
 
 ```sh

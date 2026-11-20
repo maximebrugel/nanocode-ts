@@ -1,3 +1,4 @@
+mod board;
 mod branch;
 mod bridge;
 mod cells;
@@ -567,6 +568,7 @@ struct Annotation {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Command {
+    Board(board::Request),
     HandOpen {
         #[serde(default)]
         name: Option<String>,
@@ -2162,6 +2164,7 @@ fn executed<T: Serialize>(future: impl Future<Output = Result<T, String>> + 'sta
 
 fn execute(command: Command) -> Executed {
     match command {
+        Command::Board(request) => executed(board::execute(request)),
         Command::HandOpen {
             name,
             workspace,

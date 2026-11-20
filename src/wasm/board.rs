@@ -1,0 +1,417 @@
+use std::{cell::RefCell, collections::BTreeMap, num::NonZeroU32, sync::Arc};
+
+use nanocode::turnlog::{LogHost, SqlLog};
+use nanocode_board::{
+    Applied, Board, BoardError, ClaimId, Op, Phase, Rejection, Task, TaskId,
+    access::{Identity, Verifier},
+    shards::{self, Merged, Route},
+    steer::Steer,
+};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use super::store::WorkerStore;
+
+thread_local! {
+    static BOARDS: RefCell<BTreeMap<u32, Option<Vec<Board>>>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Request {
+    Close {
+        board: u32,
+    },
+    Group {
+        board: u32,
+        writes: Vec<Write>,
+    },
+    Open {
+        actor: String,
+        partitions: NonZeroU32,
+        scope: String,
+    },
+    Ready {
+        at_ms: u64,
+        board: u32,
+        #[serde(default)]
+        label: Option<(String, String)>,
+    },
+    Refresh {
+        board: u32,
+    },
+    Steers {
+        board: u32,
+        #[serde(default)]
+        claim: Option<ClaimId>,
+        task: TaskId,
+    },
+    Task {
+        at_ms: u64,
+        board: u32,
+        task: TaskId,
+    },
+    Tasks {
+        at_ms: u64,
+        board: u32,
+    },
+    Write {
+        board: u32,
+        write: Write,
+    },
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Write {
+    at_ms: u64,
+    #[serde(default)]
+    by: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    op: Op,
+}
+
+struct Trusted;
+
+impl Verifier for Trusted {
+    fn verify(&self, credential: &str) -> Option<String> {
+        Some(credential.to_owned())
+    }
+}
+
+pub(crate) async fn execute(request: Request) -> Result<Value, String> {
+    match request {
+        Request::Close { board } => {
+            BOARDS.with_borrow_mut(|boards| boards.remove(&board));
+            Ok(Value::Null)
+        }
+        Request::Group { board, writes } => {
+            let mut boards = take(board)?;
+            let verdicts = group(&mut boards, writes).await;
+            put(board, boards);
+            Ok(Value::Array(verdicts?))
+        }
+        Request::Open {
+            actor,
+            partitions,
+            scope,
+        } => open(&scope, &actor, partitions).await,
+        Request::Ready {
+            at_ms,
+            board,
+            label,
+        } => read(board, |merged| {
+            merged
+                .ready(at_ms)
+                .into_iter()
+                .filter_map(|(_, id)| merged.task(id))
+                .filter(|task| {
+                    label
+                        .as_ref()
+                        .is_none_or(|(key, value)| task.spec.labels.get(key) == Some(value))
+                })
+                .map(|task| view(merged, task, at_ms))
+                .collect()
+        }),
+        Request::Refresh { board } => {
+            let mut boards = take(board)?;
+            let mut refreshed = Ok(Value::Null);
+            for partition in &mut boards {
+                if let Err(error) = partition.refresh().await {
+                    refreshed = Err(error.to_string());
+                    break;
+                }
+            }
+            put(board, boards);
+            refreshed
+        }
+        Request::Steers { board, claim, task } => BOARDS.with_borrow(|boards| {
+            let boards = boards
+                .get(&board)
+                .ok_or_else(|| unknown(board))?
+                .as_ref()
+                .ok_or_else(|| busy(board))?;
+            let merged = Merged::new(boards.iter().map(Board::fold).collect());
+            let Some(fold) = merged.home(&task).and_then(|home| merged.fold(home)) else {
+                return Ok(Value::Array(Vec::new()));
+            };
+            let steers: Vec<Value> = match &claim {
+                Some(claim) => fold
+                    .steers_for(&task, claim)
+                    .map_err(|rejection| format!("{rejection:?}"))?
+                    .map(steer)
+                    .collect(),
+                None => fold.steers(&task).map(steer).collect(),
+            };
+            Ok(Value::Array(steers))
+        }),
+        Request::Task { at_ms, board, task } => read(board, |merged| {
+            merged
+                .task(&task)
+                .map(|found| view(merged, found, at_ms))
+                .into_iter()
+                .collect()
+        })
+        .map(|found| match found {
+            Value::Array(mut list) => list.pop().unwrap_or(Value::Null),
+            _ => Value::Null,
+        }),
+        Request::Tasks { at_ms, board } => read(board, |merged| {
+            merged
+                .tasks()
+                .into_values()
+                .map(|task| view(merged, task, at_ms))
+                .collect()
+        }),
+        Request::Write { board, write } => {
+            let mut boards = take(board)?;
+            let verdict = submit(&mut boards, write).await;
+            put(board, boards);
+            verdict
+        }
+    }
+}
+
+async fn open(scope: &str, actor: &str, partitions: NonZeroU32) -> Result<Value, String> {
+    let (principal, profile) = match actor.split_once('+') {
+        Some((principal, profile)) => (principal, Some(profile)),
+        None => (actor, None),
+    };
+    let identity = Identity::verify(&Trusted, principal)
+        .and_then(|identity| match profile {
+            Some(profile) => identity.profile(profile),
+            None => Ok(identity),
+        })
+        .map_err(|denied| format!("{actor}: {denied:?}"))?;
+    let host: Arc<dyn LogHost> = Arc::new(SqlLog::new(Arc::new(WorkerStore::log())));
+    let boards = shards::open(&host, scope, partitions, &identity)
+        .await
+        .map_err(|error| error.to_string())?;
+    let handle = BOARDS.with_borrow_mut(|open| {
+        let handle = open.last_key_value().map_or(0, |(last, _)| last + 1);
+        open.insert(handle, Some(boards));
+        handle
+    });
+    Ok(json!(handle))
+}
+
+fn take(board: u32) -> Result<Vec<Board>, String> {
+    BOARDS.with_borrow_mut(|boards| {
+        boards
+            .get_mut(&board)
+            .ok_or_else(|| unknown(board))?
+            .take()
+            .ok_or_else(|| busy(board))
+    })
+}
+
+fn put(board: u32, partitions: Vec<Board>) {
+    BOARDS.with_borrow_mut(|boards| {
+        if let Some(slot) = boards.get_mut(&board) {
+            *slot = Some(partitions);
+        }
+    });
+}
+
+fn read(board: u32, query: impl FnOnce(&Merged<'_>) -> Vec<Value>) -> Result<Value, String> {
+    BOARDS.with_borrow(|boards| {
+        let boards = boards
+            .get(&board)
+            .ok_or_else(|| unknown(board))?
+            .as_ref()
+            .ok_or_else(|| busy(board))?;
+        Ok(Value::Array(query(&Merged::new(
+            boards.iter().map(Board::fold).collect(),
+        ))))
+    })
+}
+
+#[cold]
+fn busy(board: u32) -> String {
+    format!("board {board} is busy with another command")
+}
+
+#[cold]
+fn unknown(board: u32) -> String {
+    format!("board {board} is not open")
+}
+
+fn route(boards: &[Board], by: Option<&str>, op: Op) -> Result<(usize, Op), String> {
+    let writer = boards.first().ok_or("the board has no partitions")?.writer();
+    let merged = Merged::new(boards.iter().map(Board::fold).collect());
+    match merged.place(by.unwrap_or(writer), op) {
+        (Route::One(partition), op) => Ok((partition.0 as usize, op)),
+        (Route::Every, _) => Err("a write to every partition is not supported".into()),
+        (Route::Cross { .. }, _) => Err("a move across partitions is not supported".into()),
+        (Route::Refused(reason), _) => Err(reason),
+    }
+}
+
+async fn submit(boards: &mut [Board], write: Write) -> Result<Value, String> {
+    let (partition, op) = route(boards, write.by.as_deref(), write.op)?;
+    let board = boards
+        .get_mut(partition)
+        .ok_or("the write routes to a missing partition")?;
+    let applied = match (write.by, write.key) {
+        (None, Some(key)) => board.submit_keyed(&key, write.at_ms, op).await,
+        (None, None) => board.submit(write.at_ms, op).await,
+        (by, key) => board
+            .submit_group(vec![nanocode_board::Write {
+                at_ms: write.at_ms,
+                by,
+                key,
+                op,
+            }])
+            .await
+            .0
+            .pop()
+            .unwrap_or_else(|| Err(BoardError::Dropped("the group returned no verdict".into()))),
+    };
+    verdict(board, applied)
+}
+
+async fn group(boards: &mut [Board], writes: Vec<Write>) -> Result<Vec<Value>, String> {
+    let count = writes.len();
+    let mut placed: BTreeMap<usize, Vec<(usize, nanocode_board::Write)>> = BTreeMap::new();
+    for (index, write) in writes.into_iter().enumerate() {
+        let (partition, op) = route(boards, write.by.as_deref(), write.op)?;
+        placed.entry(partition).or_default().push((
+            index,
+            nanocode_board::Write {
+                at_ms: write.at_ms,
+                by: write.by,
+                key: write.key,
+                op,
+            },
+        ));
+    }
+    let mut verdicts = vec![Value::Null; count];
+    for (partition, members) in placed {
+        let board = boards
+            .get_mut(partition)
+            .ok_or("the write routes to a missing partition")?;
+        let (indices, members): (Vec<usize>, Vec<nanocode_board::Write>) =
+            members.into_iter().unzip();
+        let (results, _) = board.submit_group(members).await;
+        for (index, result) in indices.into_iter().zip(results) {
+            if let Some(slot) = verdicts.get_mut(index) {
+                *slot = verdict(board, result)?;
+            }
+        }
+    }
+    Ok(verdicts)
+}
+
+fn verdict(board: &Board, applied: Result<Applied, BoardError>) -> Result<Value, String> {
+    match applied {
+        Ok(applied) => {
+            let change = board
+                .fold()
+                .entries()
+                .iter()
+                .rev()
+                .find(|entry| entry.event == applied.event)
+                .map(|entry| &entry.change);
+            Ok(json!({
+                "change": change,
+                "event": applied.event,
+                "ok": true,
+                "seq": applied.seq,
+            }))
+        }
+        Err(BoardError::Rejected(rejection)) => Ok(json!({
+            "ok": false,
+            "rejection": rejected(&rejection),
+        })),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn rejected(rejection: &Rejection) -> Value {
+    match serde_json::to_value(rejection) {
+        Ok(Value::String(kind)) => json!({ "kind": kind }),
+        Ok(Value::Object(tagged)) => {
+            let mut out = Map::new();
+            for (kind, fields) in tagged {
+                out.insert("kind".into(), Value::String(kind));
+                match fields {
+                    Value::Object(fields) => {
+                        for (name, value) in fields {
+                            out.insert(camel(&name), value);
+                        }
+                    }
+                    value => {
+                        out.insert("value".into(), value);
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Ok(value) => json!({ "kind": "Unknown", "value": value }),
+        Err(error) => json!({ "kind": "Unknown", "value": error.to_string() }),
+    }
+}
+
+fn camel(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for character in name.chars() {
+        if character == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(character.to_uppercase());
+            upper = false;
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+fn steer(steer: &Steer) -> Value {
+    json!({
+        "atMs": steer.at_ms,
+        "body": steer.body,
+        "by": steer.by,
+        "seq": steer.seq,
+        "to": steer.to,
+    })
+}
+
+fn view(merged: &Merged<'_>, task: &Task, at_ms: u64) -> Value {
+    let mut out = json!({
+        "assignee": task.assignee,
+        "attempts": task.attempts,
+        "dueAtMs": task.due_at_ms,
+        "id": task.spec.id,
+        "labels": task.spec.labels,
+        "needs": task.spec.needs,
+        "parent": merged.parent(&task.spec.id),
+        "rank": task.rank,
+        "replies": task
+            .replies
+            .iter()
+            .map(|(by, body)| json!({ "body": body, "by": by }))
+            .collect::<Vec<_>>(),
+        "spec": task.spec.spec,
+        "stage": task.stage(at_ms).to_string(),
+    });
+    let phase = match &task.phase {
+        Phase::Blocked { kind, reason } => {
+            json!({ "blocked": { "kind": kind, "reason": reason }, "phase": "blocked" })
+        }
+        Phase::Cancelled { reason } => json!({ "phase": "cancelled", "reason": reason }),
+        Phase::Claimed {
+            claim,
+            until_ms,
+            worker,
+        } => json!({ "claim": claim, "phase": "claimed", "untilMs": until_ms, "worker": worker }),
+        Phase::Done { result } => json!({ "outcome": { "done": result }, "phase": "done" }),
+        Phase::Failed { error } => json!({ "outcome": { "failed": error }, "phase": "failed" }),
+        Phase::Open => json!({ "phase": "open" }),
+    };
+    if let (Value::Object(out), Value::Object(phase)) = (&mut out, phase) {
+        out.extend(phase);
+    }
+    out
+}

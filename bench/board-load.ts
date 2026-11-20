@@ -7,6 +7,7 @@ import * as Readline from 'node:readline'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { Board, Sql } from 'nanocode-ts/node'
+import { Sql as Postgres } from 'nanocode-ts/postgres'
 
 type Config = {
   children: number
@@ -19,6 +20,7 @@ type Config = {
   pollMs: number
   postMs: number
   seed: number
+  sql: 'sqlite' | 'postgres'
   steerShare: number
   workers: readonly number[]
   workMaxMs: number
@@ -107,11 +109,24 @@ function parse(argv: readonly string[]): Config {
     pollMs: number('poll-ms', 25),
     postMs: number('post-ms', 45_000),
     seed: number('seed', 1),
+    sql: backend(flags.get('sql') ?? 'sqlite'),
     steerShare: number('steer', 0.02),
     workers: list('workers', '4,8,16'),
     workMaxMs: number('work-max-ms', 50),
     workMinMs: number('work-min-ms', 5),
   }
+}
+
+function backend(name: string) {
+  if (name !== 'sqlite' && name !== 'postgres') throw new Error('--sql takes sqlite or postgres')
+  if (name === 'postgres') databaseUrl()
+  return name
+}
+
+function databaseUrl() {
+  const url = process.env.DATABASE_URL
+  if (!url) throw new Error('--sql postgres needs DATABASE_URL, a postgres:// URL')
+  return url
 }
 
 function swarm(cell: Cell, draw: () => number, name: string): Board.NewTask[] {
@@ -199,13 +214,36 @@ function events(value: unknown, into: Event[]) {
   for (const item of Object.values(record)) events(item, into)
 }
 
-function audit(path: string, cell: Cell, kills: ReadonlyMap<string, number>) {
-  const db = new DatabaseSync(path, { readOnly: true })
-  const rows = db
-    .prepare('SELECT scope, seq, body FROM nanocode_log ORDER BY scope, seq')
-    .all() as { body: string; scope: string; seq: number }[]
-  db.close()
+const auditQuery = 'SELECT scope, seq, body FROM nanocode_log ORDER BY scope, seq'
 
+async function logRows(where: Where) {
+  if (where.sql === 'sqlite') {
+    const db = new DatabaseSync(where.path, { readOnly: true })
+    const rows = db.prepare(auditQuery).all() as { body: string; scope: string; seq: number }[]
+    db.close()
+    return rows
+  }
+  const host = Postgres.open(where.url, { schema: where.schema })
+  try {
+    const [rows = []] = await host.transaction('log', 'audit', [[auditQuery]], 'read')
+    await host.transaction('log', 'drop', [['DROP SCHEMA ' + where.schema + ' CASCADE']], 'schema')
+    return rows.map(([scope, seq, body]) => ({
+      scope: String(scope),
+      seq: Number(seq),
+      body: String(body),
+    }))
+  } finally {
+    await host.close()
+  }
+}
+
+type Where = { sql: 'sqlite'; path: string } | { sql: 'postgres'; url: string; schema: string }
+
+function audit(
+  rows: readonly { body: string; scope: string; seq: number }[],
+  cell: Cell,
+  kills: ReadonlyMap<string, number>,
+) {
   const violations: string[] = []
   const claimed = new Map<string, number>()
   const finishes = new Map<string, number>()
@@ -322,8 +360,22 @@ function audit(path: string, cell: Cell, kills: ReadonlyMap<string, number>) {
 async function run(cell: Cell) {
   Fs.mkdirSync(output, { recursive: true })
   const dir = Fs.mkdtempSync(Path.join(output, 'p' + cell.partition + '-w' + cell.worker + '-'))
-  const path = Path.join(dir, 'board.sqlite')
-  const sql = Sql.open(path)
+  const where: Where =
+    cell.sql === 'sqlite'
+      ? { sql: 'sqlite', path: Path.join(dir, 'board.sqlite') }
+      : {
+          sql: 'postgres',
+          url: databaseUrl(),
+          schema:
+            'bench_' +
+            Path.basename(dir)
+              .replace(/[^A-Za-z0-9]/g, '_')
+              .toLowerCase(),
+        }
+  const sql =
+    where.sql === 'sqlite'
+      ? Sql.open(where.path)
+      : Postgres.open(where.url, { schema: where.schema })
   const board = await Board.open({ actor: 'agent:bench', partitions: cell.partition, scope, sql })
   const granted = await board.grant(
     { can: { '*': ['manage'] }, who: [{ id: 'agent', kind: 'kind' }] },
@@ -385,7 +437,7 @@ async function run(cell: Cell) {
       leaseMs: cell.leaseMs,
       name,
       partitions: cell.partition,
-      path,
+      where,
       pollMs: cell.pollMs,
       scope,
       seed: cell.seed * 1_000_003 + index * 1009 + incarnation,
@@ -495,9 +547,9 @@ async function run(cell: Cell) {
   await board.refresh()
   const notDone = (await board.tasks()).filter((task) => task.phase !== 'done')
   await board.close()
-  sql.close()
+  await sql.close()
 
-  const audited = audit(path, cell, kills)
+  const audited = audit(await logRows(where), cell, kills)
   violations.push(...audited.violations)
   if (!drained) violations.push(open.size + ' swarms not done after the drain')
   if (notDone.length > 0)

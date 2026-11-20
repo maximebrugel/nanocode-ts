@@ -1,11 +1,12 @@
 import { Board, Sql } from 'nanocode-ts/node'
+import { Sql as Postgres } from 'nanocode-ts/postgres'
 
 type Role = {
   concurrency: number
   leaseMs: number
   name: string
   partitions: number
-  path: string
+  where: { sql: 'sqlite'; path: string } | { sql: 'postgres'; url: string; schema: string }
   pollMs: number
   scope: string
   seed: number
@@ -39,10 +40,13 @@ function random(seed: number) {
 }
 
 function classify(error: unknown) {
-  const fields = error as { errcode?: unknown; message?: unknown } | null
+  const fields = error as { code?: unknown; errcode?: unknown; message?: unknown } | null
   const text = String(fields?.message ?? error)
+  if (fields?.code === '40001' || fields?.code === '40P01' || fields?.code === '55P03')
+    return 'busy'
   if (fields?.errcode === 5 || fields?.errcode === 6 || /locked|busy/i.test(text)) return 'busy'
-  if (fields?.errcode === 19 || /constraint/i.test(text)) return 'constraint'
+  if (fields?.code === '23505' || fields?.errcode === 19 || /constraint/i.test(text))
+    return 'constraint'
   return 'other'
 }
 
@@ -59,20 +63,23 @@ const metrics = {
   write: {} as Histogram,
 }
 
-const host = Sql.open(role.path)
+const where = role.where
+const host: Board.Options['sql'] & { close(): unknown } =
+  where.sql === 'sqlite'
+    ? Sql.open(where.path)
+    : Postgres.open(where.url, { schema: where.schema, max: 2 })
+
+const failed = (error: unknown) => {
+  const type = classify(error)
+  metrics.errors[type] = (metrics.errors[type] ?? 0) + 1
+  metrics.lastError = String((error as Error | null)?.message ?? error).slice(0, 200)
+}
 
 const timed: Board.Options['sql'] = {
   ...host,
   transaction(kind, operation, statements, access) {
     const started = performance.now()
-    try {
-      return host.transaction(kind, operation, statements, access)
-    } catch (error) {
-      const type = classify(error)
-      metrics.errors[type] = (metrics.errors[type] ?? 0) + 1
-      metrics.lastError = String((error as Error | null)?.message ?? error).slice(0, 200)
-      throw error
-    } finally {
+    const done = () => {
       const ms = performance.now() - started
       const entry = (metrics.operations[operation] ??= { count: 0, ms: 0 })
       entry.count++
@@ -80,6 +87,29 @@ const timed: Board.Options['sql'] = {
       const reads = access === 'read' || /load|scan|read/.test(operation)
       record(reads ? metrics.read : metrics.write, ms)
     }
+    let result: ReturnType<Board.Options['sql']['transaction']>
+    try {
+      result = host.transaction(kind, operation, statements, access)
+    } catch (error) {
+      failed(error)
+      done()
+      throw error
+    }
+    if (!(result instanceof Promise)) {
+      done()
+      return result
+    }
+    return result.then(
+      (rows) => {
+        done()
+        return rows
+      },
+      (error: unknown) => {
+        failed(error)
+        done()
+        throw error
+      },
+    )
   },
 }
 
@@ -149,8 +179,8 @@ process.on('SIGTERM', () => {
   void pool
     .stop()
     .then(() => board.close())
+    .then(() => host.close())
     .then(() => {
-      host.close()
       report()
       process.exit(0)
     })

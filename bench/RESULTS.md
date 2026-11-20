@@ -32,7 +32,7 @@
 - Box: `nanoco-ef11` under an `nc-build` bench lease of 6 cores (`taskset -c 6-11`), 2026-11-20
 - CPU: AMD EPYC 9254 24-Core Processor
 - Node: v26.13.1
-- nanocode-ts: d3d23e0 (master at run time) plus the bench as landed in b720738
+- nanocode-ts: d3d23e0 (master at run time) plus the bench as landed in 0b12a49
 
 ## Results
 

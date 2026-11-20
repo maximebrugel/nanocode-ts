@@ -21,6 +21,8 @@ export type Options = {
   max?: number
   /** The largest bound string or blob, in bytes, the runtime may store (default unlimited). */
   valueLimit?: number
+  /** The shortest gap, in ms, between two nanocode_log notifications this host sends (default 10). */
+  notifyMs?: number
 }
 
 const twins: ReadonlyMap<string, string> = new Map([
@@ -112,6 +114,9 @@ export function open(url: string, options: Options = {}): Host {
   const schema = options.schema
   if (schema !== undefined && !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(schema))
     throw new Error('schema must be a plain identifier, got ' + JSON.stringify(schema))
+  const notifyMs = options.notifyMs ?? 10
+  if (!Number.isFinite(notifyMs) || notifyMs < 0)
+    throw new Error('notifyMs must be a non-negative number')
 
   const sql = postgres(url, {
     ...(max === undefined ? {} : { max }),
@@ -135,25 +140,21 @@ export function open(url: string, options: Options = {}): Host {
     return found
   }
 
+  // At most one notification per notifyMs: a burst of writes sends one at its start and one after.
   const payload = schema ?? ''
-  let notifying = false
-  let pending = false
+  let notified = 0
+  let notifying: ReturnType<typeof setTimeout> | undefined
   const notify = () => {
-    if (closed) return
-    if (notifying) {
-      pending = true
-      return
-    }
-    notifying = true
-    sql`SELECT pg_notify(${channel}, ${payload})`
-      .catch(() => {})
-      .finally(() => {
-        notifying = false
-        if (pending) {
-          pending = false
-          notify()
-        }
-      })
+    if (closed || notifying !== undefined) return
+    notifying = setTimeout(
+      () => {
+        notifying = undefined
+        if (closed) return
+        notified = Date.now()
+        sql`SELECT pg_notify(${channel}, ${payload})`.catch(() => {})
+      },
+      Math.max(0, notified + notifyMs - Date.now()),
+    )
   }
 
   let closed = false
@@ -182,6 +183,7 @@ export function open(url: string, options: Options = {}): Host {
     async close() {
       if (closed) return
       closed = true
+      if (notifying !== undefined) clearTimeout(notifying)
       await sql.end({ timeout: 5 })
     },
   }

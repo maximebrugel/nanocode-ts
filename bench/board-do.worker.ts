@@ -326,6 +326,8 @@ export class BoardObject extends DurableObject<Env> {
       case 'drop_checkpoints':
         this.ctx.storage.sql.exec('DELETE FROM nanocode_checkpoint')
         return null
+      case 'checkpoint':
+        return (await this.board(lead)).checkpoint()
       case 'tasks': {
         const board = await this.board(lead)
         const t0 = performance.now()

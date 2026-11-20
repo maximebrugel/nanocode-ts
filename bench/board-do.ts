@@ -491,10 +491,11 @@ async function replay(config: Config) {
     for (const checkpoints of config.checkpoints) {
       const checkpointEvery = checkpoints === 'off' ? 0 : undefined
       if (checkpoints === 'on') {
-        // One uncounted wake with checkpoints on, so a run after an off pass (which dropped them
-        // and saved none) starts from a checkpoint as a live object would.
+        // One uncounted wake that saves a checkpoint, as a closing board does, so each timed wake
+        // folds only the few events the wakes before it wrote. An aborted object closes nothing
+        // and saves one only every 4,096 events, so a live wake folds up to that many more.
         await restart(object)
-        await send(object, { method: 'open' })
+        await send(object, { method: 'checkpoint' })
       }
       let opened: unknown = null
       const wake = { abort: [] as number[], boot: [] as number[], open: [] as number[] }
@@ -534,7 +535,7 @@ async function replay(config: Config) {
         steps.warm.push(warm.wallMs)
         // A first write after the wake: post one task, claim it, finish it.
         const w0 = performance.now()
-        const id = 'w' + size + '-' + index
+        const id = 'w' + size + '-' + checkpoints + '-' + index
         await send(object, { method: 'post', tasks: [{ id, labels: {}, needs: [], spec: 'wake' }] })
         const claimed = await send<Claim>(object, {
           client: 'lead',

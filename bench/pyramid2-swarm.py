@@ -140,8 +140,9 @@ class Swarm:
                 status[body["id"]] = body.get("status")
             elif frame.get("type") == "message.updated" and body.get("role") == "assistant" and body.get("turn_id"):
                 answered.add(body["turn_id"])
-        state = status.get(self.turn)
-        if state in ENDED_BADLY or state == "succeeded" and self.turn in answered:
+        turn = next(iter(status), None)
+        state = status.get(turn)
+        if state in ENDED_BADLY or state == "succeeded" and turn in answered:
             return state
         return None
 
@@ -157,7 +158,7 @@ class Swarm:
             self.run.threads_by_node[node] = self.run.threads_by_node.get(node, 0) + 1
         threading.Thread(target=self.follow, daemon=True).start()
         start.wait()
-        self.turn = str(uuid.uuid4())
+        self.turn = str(uuid.uuid4())  # request id; the server names the turn <thread>.<n>
         prompt = "e2e:swarm %d swarm-%s-%d" % (self.args.children, self.args.tag, self.index)
         sent = time.monotonic()
         try:
@@ -179,31 +180,35 @@ class Swarm:
         self.measure(sent, acked, frames)
 
     def measure(self, sent, acked, frames):
-        running, spawned, seen, settled = None, None, {}, {}
+        # Server times (frame data "at", ms) where present; client receive times otherwise.
+        running, posted, seen, settled = None, [], {}, {}
         for t, frame in frames:
             body = frame.get("data") or {}
-            if frame.get("type") == "turn.updated" and body.get("id") == self.turn and body.get("status") == "running":
+            at = body.get("at") / 1000.0 if isinstance(body.get("at"), (int, float)) else None
+            if frame.get("type") == "turn.updated" and body.get("status") == "running":
                 running = running or t
-            name, row = body.get("name"), str(body.get("id") or body.get("call_id") or "")
-            if name == "spawn_agent" and spawned is None and t >= sent:
-                spawned = t
-            if name == "subagent" or ":subagent:" in row:
-                seen.setdefault(row, t)
-                text = json.dumps(body)
-                if re.search(r'"(completed|done|succeeded|finished)"|\bcompleted\b', text):
-                    settled.setdefault(row, t)
+            if frame.get("type") != "tool.updated":
+                continue
+            name, row, state = body.get("name"), str(body.get("id") or ""), body.get("status")
+            if name == "spawn_agent" and state == "running":
+                posted.append(at or t)
+            if name == "subagent":
+                if state == "running":
+                    seen.setdefault(row, at or t)
+                elif state == "succeeded":
+                    settled.setdefault(row, at or t)
         ended = frames[-1][0]
+        order = sorted(seen, key=lambda r: int(r.rsplit(":", 1)[1]) if r.rsplit(":", 1)[1].isdigit() else 0)
         with self.run.lock:
             self.run.ack.append((acked - sent) * 1000)
             if running:
                 self.run.claim.append((running - sent) * 1000)
             self.run.root.append((ended - sent) * 1000)
-            for row, t in seen.items():
-                if spawned:
-                    self.run.spawn_to_child.append((t - spawned) * 1000)
+            for i, row in enumerate(order):
+                if i < len(posted):
+                    self.run.spawn_to_child.append(max(0.0, seen[row] - posted[i]) * 1000)
                 if row in settled:
-                    self.run.child_run.append((settled[row] - t) * 1000)
-                    self.run.child_total.append((settled[row] - sent) * 1000)
+                    self.run.child_run.append((settled[row] - seen[row]) * 1000)
             self.run.turns_done += 1
             self.run.children_done += len(settled)
             self.run.ends.append(ended)
@@ -273,7 +278,7 @@ def main():
         "turns_per_s": round(turns / elapsed, 2) if elapsed > 0 else None,
         "swarms_per_s": round(run.turns_done / elapsed, 3) if elapsed > 0 else None,
         "ack_ms": dist(run.ack), "root_claim_ms": dist(run.claim), "spawn_to_child_ms": dist(run.spawn_to_child),
-        "child_run_ms": dist(run.child_run), "child_total_ms": dist(run.child_total), "root_turn_ms": dist(run.root),
+        "child_run_ms": dist(run.child_run), "root_turn_ms": dist(run.root),
         "threads_by_node": run.threads_by_node, "errors": run.errors, "error_samples": run.samples,
         "board": board, "metrics_delta": delta(before, after)}), flush=True)
 

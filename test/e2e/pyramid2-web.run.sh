@@ -3,7 +3,7 @@
 # 32 swarm slots in the background. Usage, from a copy of this repo in your own mktemp dir that also holds
 # node_modules (playwright, ws) and browsers/ (PLAYWRIGHT_BROWSERS_PATH):
 #   test/e2e/pyramid2-web.run.sh MINUTES PHASES TAG
-# Env: PYRAMID2_TOKEN_FILE (read by path only), WEB, NODES (comma-separated), PROBES, SOAK_MIN, BOX_CLOSE (epoch s:
+# Env: CORES (default 4), PYRAMID2_TOKEN_FILE (read by path only), WEB, NODES (comma-separated), PROBES, SOAK_MIN, BOX_CLOSE (epoch s:
 # no take may run past it). Leaves out-TAG/result.json, screenshots, spec-TAG.log and swarm-TAG/.
 set -u
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -11,7 +11,7 @@ work=$PWD
 min=$1 phases=$2 tag=$3
 nodes=${NODES:-http://127.0.0.1:18480,http://127.0.0.1:18500,http://127.0.0.1:18520}
 if [ -n "${BOX_CLOSE:-}" ] && [ $(( $(date +%s) + min*60 )) -gt "$BOX_CLOSE" ]; then echo "take would run past the box close"; exit 1; fi
-lease=$(nc-build slots take --cores 4 --label p2live-swarms-web --kind build --machine "$(hostname)" --minutes "$min" --env) || { echo "take failed"; exit 1; }
+lease=$(nc-build slots take --cores "${CORES:-4}" --label p2live-swarms-web --kind build --machine "$(hostname)" --minutes "$min" --env) || { echo "take failed"; exit 1; }
 eval "$lease"
 echo "lease $NC_BUILD_LEASE ($NC_BUILD_PREFIX)"
 trap 'kill $(cat "$work/swarm-$tag.pid") 2>/dev/null; nc-build slots give "$NC_BUILD_LEASE"; echo "gave $NC_BUILD_LEASE"' EXIT

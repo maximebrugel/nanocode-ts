@@ -41,7 +41,9 @@ const sql = Sql.open(process.env.DATABASE_URL!, { schema: 'board', max: 2 })
 const board = await Board.open({ sql, scope: 'demo', actor: 'agent:lead' })
 ```
 
-`Sql.open(url, { schema?, max?, valueLimit? })` opens a connection pool. `schema` runs every statement in that schema and creates it if missing, `max` is the pool size and `valueLimit` caps a stored value. It also exports `Board`.
+`Sql.open(url, { schema?, max?, valueLimit?, notifyMs? })` opens a connection pool. `schema` runs every statement in that schema and creates it if missing, `max` is the pool size and `valueLimit` caps a stored value. It also exports `Board`.
+
+After each committed write to the board's log, a Postgres host sends `pg_notify('nanocode_log', <schema>)`, at most once every `notifyMs` (default 10). `Sql.wake(sql, { debounceMs? })` listens on that channel and returns a `wake` for `Board.pool`, so pools on every machine poll as soon as work lands, once per `debounceMs` burst (default 5). Boards in other schemas don't wake it. In `test/board-pool-wake.test.ts`, two processes with `pollMs: 5000` drain 20 tasks in 74–80 ms with wake and in 4,976–5,001 ms without. With busy pools (`bench:board --sql postgres --workers 8 --wake on`), wake helps 8 partitions: task p50 / p99 go from 365 / 1,467 to 310 / 967 ms at `--poll-ms 1000`, and from 322 / 1,169 to 305 / 851 ms at 25. At 1 partition it costs about 15% of claims/s, and p50 / p99 go from 448 / 1,414 to 461 / 1,044 ms at 1000 and from 364 / 1,105 to 448 / 1,121 ms at 25. So leave it off for one partition at high load ([bench/RESULTS.md](../bench/RESULTS.md)).
 
 For tests, `await Board.memorySql()` is an in-memory host (Node only). Share one host between handles to share a board. `board.close()` closes a handle, and `sql.close()` closes the Node, memory or Postgres host.
 
@@ -122,6 +124,8 @@ const pool = Board.pool(board, {
 ```
 
 `label: [key, value]` limits the pool to tasks with that label, and `idleMs` retires it after that long with nothing to do. `lease` has `signal`, `tookOver`, `steers()` and `heed(seq)`. A run that did not heed its steers still finishes: the pool heeds the last one and retries. `pool.idle()` waits for a poll that finds nothing running or ready, `pool.stats()` counts `claimed`, `done`, `failed`, `lost`, `released`, `delivered`, `unheard`, `retries` and `errors`, and `pool.stop()` aborts the runs and releases their claims. `cap` is a number, a `{ max, label }` cap, or a function from the task to one (or `undefined`), and the pool claims each task under it. A label cap applies only to tasks that carry that label. A refused claim is skipped.
+
+`wake: (notify) => unsubscribe` makes the pool poll as soon as `notify` fires, and `pollMs` stays the fallback. A pool with every slot running ignores a wake (a run that ends polls anyway), and the pool unsubscribes when it stops or retires. On Postgres pass `wake: Sql.wake(sql)` (see [Choosing a backend](#choosing-a-backend)). node:sqlite has no cross-process notify, so leave `wake` unset there and the pool keeps polling.
 
 ## Partitions
 

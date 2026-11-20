@@ -20,6 +20,7 @@ type Entry = {
   id?: string
   key?: string | null
   kind: string
+  lane?: string
   labels?: Record<string, string>
   leaseMs?: number
   message?: string
@@ -28,6 +29,7 @@ type Entry = {
   outcome?: Board.Outcome
   parent?: string | null
   phase?: string
+  pool?: boolean
   rejection?: string
   rejectionCap?: unknown
   seq?: number
@@ -322,6 +324,31 @@ function check({ entries, tasks, steers, unjournaled, killedRuns, partitions }: 
               show(counted.map((lease) => lease.claim.id)),
           )
       }
+      const lane = byId.get(claim.id!)?.labels.lane
+      if (lane === 'capA' || lane === 'capB') {
+        const sharing = holding.filter(
+          (lease) => lease.claim.id !== claim.id && byId.get(lease.claim.id!)?.labels.lane === lane,
+        )
+        if (sharing.length >= lanes[lane])
+          violations.push(
+            'lane ' +
+              lane +
+              ' held ' +
+              (sharing.length + 1) +
+              ' > ' +
+              lanes[lane] +
+              ' at ' +
+              partition +
+              '/' +
+              claim.seq +
+              ' by ' +
+              show(
+                [...sharing.map((lease) => lease.claim), claim].map(
+                  (entry) => (entry.pool ? 'pool:' : 'raw:') + entry.id,
+                ),
+              ),
+          )
+      }
       if (journaled(claim) && !cancelled(claim.id!))
         active.push({
           claim,
@@ -458,6 +485,9 @@ test('the fuzz checker flags broken histories', () => {
     task('l1', { ...open, labels: { lane: 'capA', project: 'proj-2' } }),
     task('l2', { ...open, labels: { lane: 'capA', project: 'proj-2' } }),
     task('l3', open),
+    task('m1', { ...open, labels: { lane: 'capB', project: 'proj-3' } }),
+    task('m2', { ...open, labels: { lane: 'capB', project: 'proj-3' } }),
+    task('m3', { ...open, labels: { lane: 'capB', project: 'proj-3' } }),
     task('gone2', { ...open, phase: 'cancelled' }),
   ]
   const lease = (id: string, claim: string, seq: number, cap?: Board.Cap) =>
@@ -476,6 +506,9 @@ test('the fuzz checker flags broken histories', () => {
     lease('l2', 'agent:c0.21', 21, { max: lanes.capA, label: ['lane', 'capA'] }),
     lease('l1', 'agent:c0.22', 22),
     lease('l3', 'agent:c0.30', 30),
+    lease('m1', 'agent:c0.50', 50, { max: lanes.capB, label: ['lane', 'capB'] }),
+    { ...lease('m2', 'agent:c0p.51', 51, { max: lanes.capB, label: ['lane', 'capB'] }), pool: true },
+    { ...lease('m3', 'agent:c0p.52', 52), pool: true },
     entry({ kind: 'renew', id: 'l3', claim: 'agent:c0.30', seq: 31, t0: 1_000, leaseMs: 10 }),
     lease('l3', 'agent:c0.32', 32),
     lease('gone2', 'agent:c0.40', 40),
@@ -525,12 +558,21 @@ test('the fuzz checker flags broken histories', () => {
     'l2 was claimed at ',
     'l1 was claimed at 22 while held',
     'l1 release was refused NotHolder',
+    'lane capA held 2 > 1',
+    'lane capB held 3 > 2 at ' + partitionOf('proj-3', 4) + '/52 by ["raw:m1","pool:m2","pool:m3"]',
   ])
     assert.ok(
       violations.some((violation) => violation.startsWith(expected)),
       expected + ' in ' + JSON.stringify(violations),
     )
-  for (const unexpected of ['seq ', 'l3 was claimed at 32', 'claim refused Full', 'gone2 '])
+  for (const unexpected of [
+    'seq ',
+    'l3 was claimed at 32',
+    'claim refused Full',
+    'gone2 ',
+    'lane capB held 2',
+    'm3 was claimed',
+  ])
     assert.ok(
       !violations.some((violation) => violation.startsWith(unexpected)),
       unexpected + ' in ' + JSON.stringify(violations),
@@ -695,7 +737,11 @@ test(
             count('finish') +
             ' finishes, ' +
             entries.filter((entry) => entry.kind === 'pool-run').length +
-            ' pool runs, ' +
+            ' pool runs (' +
+            entries.filter((entry) => entry.kind === 'claim' && entry.ok && entry.pool).length +
+            ' pool claims, ' +
+            entries.filter((entry) => entry.kind === 'pool-start' && entry.lane !== 'pool').length +
+            ' label-capped pools), ' +
             count('steer') +
             ' steers, ' +
             count('heed') +
@@ -708,6 +754,7 @@ test(
         const rejected = new Map<string, number>()
         for (const entry of entries.filter((entry) => entry.ok === false)) {
           const name =
+            (entry.pool ? 'pool-' : '') +
             entry.kind +
             ':' +
             (entry.rejection ?? 'error') +

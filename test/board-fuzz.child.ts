@@ -162,44 +162,58 @@ function capFor(id: string): Board.Cap | undefined {
   return undefined
 }
 
+async function claimed(
+  target: Board.Board,
+  id: string,
+  options: { cap?: Board.Cap | undefined; leaseMs: number },
+  pool: boolean,
+) {
+  const { cap, leaseMs } = options
+  const { result, t0, t1 } = await timed(() =>
+    target.claim(id, cap === undefined ? { leaseMs } : { cap, leaseMs }),
+  )
+  record(
+    result.ok
+      ? {
+          kind: 'claim',
+          ok: true,
+          id,
+          cap: cap ?? null,
+          claim: result.claim,
+          leaseMs,
+          pool,
+          seq: result.seq,
+          t0,
+          t1,
+          tookOver: result.tookOver,
+          untilMs: result.untilMs,
+        }
+      : {
+          kind: 'claim',
+          ok: false,
+          id,
+          cap: cap ?? null,
+          leaseMs,
+          pool,
+          rejection: result.rejection.kind,
+          rejectionCap: (result.rejection as { cap?: unknown }).cap ?? null,
+          t0,
+          t1,
+        },
+  )
+  return result
+}
+
 async function claim() {
   const ready = random() < 0.6 ? await board.ready() : []
   for (const task of ready) learn(task)
   const id = pick(ready)?.id ?? (random() < 0.8 ? pick(live) : pick(known))
   if (id === undefined || held.has(id) || !placed.has(id)) return
-  const leaseMs = 50 + below(251)
-  const cap = capFor(id)
-  const { result, t0, t1 } = await timed(() =>
-    board.claim(id, cap === undefined ? { leaseMs } : { cap, leaseMs }),
-  )
+  const result = await claimed(board, id, { cap: capFor(id), leaseMs: 50 + below(251) }, false)
   if (!result.ok) {
-    record({
-      kind: 'claim',
-      ok: false,
-      id,
-      cap: cap ?? null,
-      leaseMs,
-      rejection: result.rejection.kind,
-      rejectionCap: (result.rejection as { cap?: unknown }).cap ?? null,
-      t0,
-      t1,
-    })
     if (result.rejection.kind === 'Terminal') live = live.filter((other) => other !== id)
     return
   }
-  record({
-    kind: 'claim',
-    ok: true,
-    id,
-    cap: cap ?? null,
-    claim: result.claim,
-    leaseMs,
-    seq: result.seq,
-    t0,
-    t1,
-    tookOver: result.tookOver,
-    untilMs: result.untilMs,
-  })
   held.set(id, { claim: result.claim, id })
 }
 
@@ -287,6 +301,22 @@ async function steer() {
   )
 }
 
+function poolCap(lane: Lane | 'pool', poolRandom: () => number): Board.PoolOptions['cap'] {
+  const roll = poolRandom()
+  if (lane !== 'pool') {
+    const shared: Board.Cap = { max: lanes[lane], label: ['lane', lane] }
+    return roll < 0.5 ? shared : (task) => (task.labels.lane === lane ? shared : 1)
+  }
+  if (roll < 0.3) return undefined
+  if (roll < 0.6) return 2 + Math.floor(poolRandom() * 3)
+  return () => {
+    const chosen = poolRandom()
+    if (chosen < 0.4) return undefined
+    if (chosen < 0.7) return 2 + Math.floor(poolRandom() * 3)
+    return { max: 1, label: ['lane', 'capA'] }
+  }
+}
+
 async function startPool() {
   const poolRandom = generator(config.seed ^ 0x5bd1e995)
   const poolSql = Sql.open(config.path)
@@ -296,10 +326,40 @@ async function startPool() {
     actor: actor + 'p',
     partitions: config.partitions,
   })
+  const lane = (['pool', 'capA', 'capB'] as const)[Math.floor(poolRandom() * 3)]!
+  const cap = poolCap(lane, poolRandom)
+  record({
+    kind: 'pool-start',
+    lane,
+    capKind: typeof cap === 'function' ? 'function' : typeof cap === 'number' ? 'number' : cap === undefined ? 'none' : 'label',
+  })
+  const journaled: Board.Board = {
+    ...poolBoard,
+    claim: (id, options) => claimed(poolBoard, id, options, true),
+    finish: async (id, claim, outcome) =>
+      verdict(
+        'finish',
+        { id, claim, outcome, pool: true },
+        await timed(() => poolBoard.finish(id, claim, outcome)),
+      ),
+    heed: async (id, claim, upto) =>
+      verdict(
+        'heed',
+        { id, claim, upto, pool: true },
+        await timed(() => poolBoard.heed(id, claim, upto)),
+      ),
+    renew: async (id, claim, leaseMs) =>
+      verdict(
+        'renew',
+        { id, claim, leaseMs, pool: true },
+        await timed(() => poolBoard.renew(id, claim, leaseMs)),
+      ),
+  }
   let runs = 0
-  const pool = Board.pool(poolBoard, {
+  const pool = Board.pool(journaled, {
+    cap,
     concurrency: 1 + Math.floor(poolRandom() * 2),
-    label: ['lane', 'pool'],
+    label: ['lane', lane],
     leaseMs: 100 + Math.floor(poolRandom() * 200),
     pollMs: 20 + Math.floor(poolRandom() * 60),
     run: async (task, lease) => {

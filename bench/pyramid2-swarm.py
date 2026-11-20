@@ -132,9 +132,9 @@ class Swarm:
             self.dump.write(json.dumps({"t": now, "frame": frame}) + "\n")
             self.dump.flush()
 
-    def root_end(self):
+    def root_end(self, start=0):
         status, answered = {}, set()
-        for _, frame in self.frames:
+        for _, frame in self.frames[start:]:
             body = frame.get("data") or {}
             if frame.get("type") == "turn.updated" and body.get("id"):
                 status[body["id"]] = body.get("status")
@@ -158,8 +158,15 @@ class Swarm:
             self.run.threads_by_node[node] = self.run.threads_by_node.get(node, 0) + 1
         threading.Thread(target=self.follow, daemon=True).start()
         start.wait()
+        deadline = time.monotonic() + self.args.duration
+        while self.once() and time.monotonic() < deadline:
+            pass
+
+    def once(self):
         self.turn = str(uuid.uuid4())  # request id; the server names the turn <thread>.<n>
         prompt = "e2e:swarm %d swarm-%s-%d" % (self.args.children, self.args.tag, self.index)
+        with self.cond:
+            first = len(self.frames)
         sent = time.monotonic()
         try:
             _, status, body = self.call("POST", "/threads/%s/turns" % self.thread, {"turn_id": self.turn, "input": prompt})
@@ -169,15 +176,16 @@ class Swarm:
             return self.run.error("send_http_%d" % status, body)
         acked = time.monotonic()
         with self.cond:
-            self.cond.wait_for(lambda: self.root_end() or time.monotonic() > acked + self.args.wait_s,
+            self.cond.wait_for(lambda: self.root_end(first) or time.monotonic() > acked + self.args.wait_s,
                                timeout=self.args.wait_s + 1)
-            ended = self.root_end()
-            frames = list(self.frames)
+            ended = self.root_end(first)
+            frames = self.frames[first:]
         if ended is None:
             return self.run.error("turn_timeout", self.thread)
         if ended != "succeeded":
             return self.run.error("turn_" + ended, self.thread)
         self.measure(sent, acked, frames)
+        return True
 
     def measure(self, sent, acked, frames):
         # Server times (frame data "at", ms) where present; client receive times otherwise.
@@ -246,6 +254,7 @@ def main():
     parser.add_argument("--swarms", type=int, required=True)
     parser.add_argument("--children", type=int, default=8)
     parser.add_argument("--wait-s", type=float, default=120)
+    parser.add_argument("--duration", type=float, default=0, help="keep each slot running swarms for this many seconds")
     parser.add_argument("--tag", default=uuid.uuid4().hex[:8])
     parser.add_argument("--dump")
     args = parser.parse_args()
@@ -265,7 +274,7 @@ def main():
     t0 = time.monotonic()
     start.set()
     for w in workers:
-        w.join(args.wait_s + 60)
+        w.join(args.duration + args.wait_s + 60)
     elapsed = (max(run.ends) if run.ends else time.monotonic()) - t0
     time.sleep(1.0)
     stop.set()

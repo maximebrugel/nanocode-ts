@@ -344,6 +344,7 @@ name = "nanocode-agent-core"
 version = "0.7.0"
 dependencies = [
  "nanocode-agent-types",
+ "nanocode-hedge",
  "nanocode-home",
  "nanocode-platform",
  "nanocode-sync",
@@ -499,13 +500,13 @@ name = "nanocode-backend-codex-client"
 version = "0.7.0"
 dependencies = [
  "memchr",
- "nanocode-agent-core",
  "nanocode-agent-types",
  "nanocode-audio",
  "nanocode-bytes",
  "nanocode-compression",
  "nanocode-digest",
  "nanocode-executor",
+ "nanocode-hedge",
  "nanocode-home",
  "nanocode-http",
  "nanocode-image",
@@ -519,6 +520,31 @@ dependencies = [
  "nanocode-url",
  "nanocode-websocket",
  "nanocode-zstd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-board"
+version = "0.7.0"
+dependencies = [
+ "nanocode-board-fold",
+ "nanocode-cost-fold",
+ "nanocode-digest",
+ "nanocode-durability-core",
+ "nanocode-partitions",
+ "nanocode-sync",
+ "nanocode-turnlog",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-board-fold"
+version = "0.7.0"
+dependencies = [
+ "nanocode-durability-core",
+ "nanocode-machine",
+ "nanocode-schema",
  "serde",
  "serde_json",
 ]
@@ -602,10 +628,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-cost-fold"
+version = "0.7.0"
+dependencies = [
+ "nanocode-agent-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nanocode-digest"
 version = "0.7.0"
 dependencies = [
  "nanocode-sys",
+]
+
+[[package]]
+name = "nanocode-dispatch"
+version = "0.7.0"
+dependencies = [
+ "nanocode-board-fold",
+]
+
+[[package]]
+name = "nanocode-dispatcher"
+version = "0.7.0"
+dependencies = [
+ "nanocode-board",
+ "nanocode-dispatch",
 ]
 
 [[package]]
@@ -645,6 +695,15 @@ dependencies = [
 [[package]]
 name = "nanocode-gif"
 version = "0.7.0"
+
+[[package]]
+name = "nanocode-hedge"
+version = "0.7.0"
+dependencies = [
+ "nanocode-platform",
+ "nanocode-sync",
+ "serde",
+]
 
 [[package]]
 name = "nanocode-home"
@@ -707,6 +766,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-machine"
+version = "0.7.0"
+dependencies = [
+ "nanocode-trace",
+]
+
+[[package]]
 name = "nanocode-macro-support"
 version = "0.7.0"
 
@@ -764,6 +830,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "nanocode-partitions"
+version = "0.7.0"
 
 [[package]]
 name = "nanocode-platform"
@@ -839,12 +909,16 @@ name = "nanocode-subagents"
 version = "0.7.0"
 dependencies = [
  "nanocode-agent-core",
+ "nanocode-board",
+ "nanocode-dispatch",
+ "nanocode-dispatcher",
  "nanocode-durability-core",
  "nanocode-platform",
  "nanocode-schema",
  "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-trace",
+ "nanocode-turnlog",
  "serde",
  "serde_json",
 ]
@@ -977,6 +1051,7 @@ version = "0.7.0"
 dependencies = [
  "nanocode-compression",
  "nanocode-durability-core",
+ "nanocode-partitions",
  "nanocode-sync",
  "nanocode-sys",
  "serde",
@@ -1017,6 +1092,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "nanocode",
+ "nanocode-board",
  "nanocode-code-mode",
  "nanocode-http",
  "nanocode-sync",

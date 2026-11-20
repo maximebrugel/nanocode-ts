@@ -503,7 +503,10 @@ test('the fuzz checker flags broken histories', () => {
     lease('l1', 'agent:c0.22', 22),
     lease('l3', 'agent:c0.30', 30),
     lease('m1', 'agent:c0.50', 50, { max: lanes.capB, label: ['lane', 'capB'] }),
-    { ...lease('m2', 'agent:c0p.51', 51, { max: lanes.capB, label: ['lane', 'capB'] }), pool: true },
+    {
+      ...lease('m2', 'agent:c0p.51', 51, { max: lanes.capB, label: ['lane', 'capB'] }),
+      pool: true,
+    },
     { ...lease('m3', 'agent:c0p.52', 52), pool: true },
     entry({ kind: 'renew', id: 'l3', claim: 'agent:c0.30', seq: 31, t0: 1_000, leaseMs: 10 }),
     lease('l3', 'agent:c0.32', 32),

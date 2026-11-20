@@ -331,7 +331,14 @@ async function startPool() {
   record({
     kind: 'pool-start',
     lane,
-    capKind: typeof cap === 'function' ? 'function' : typeof cap === 'number' ? 'number' : cap === undefined ? 'none' : 'label',
+    capKind:
+      typeof cap === 'function'
+        ? 'function'
+        : typeof cap === 'number'
+          ? 'number'
+          : cap === undefined
+            ? 'none'
+            : 'label',
   })
   const journaled: Board.Board = {
     ...poolBoard,

@@ -64,19 +64,22 @@ export type Suspended = (
 
 export type Missing = { module: string; package: boolean; text: string }
 
+export type Order = readonly number[]
+
 export type Ran =
-  | { kind: 'exited'; status: number; stderr: Uint8Array; stdout: Uint8Array }
+  | { kind: 'exited'; order?: Order; status: number; stderr: Uint8Array; stdout: Uint8Array }
   | { kind: 'needs'; missing: readonly Missing[] }
   | {
       kind: 'refused'
       limit: number
+      order?: Order
       stderr: Uint8Array
       stdout: Uint8Array
       steps: bigint
       held: bigint
       asked: bigint
     }
-  | { kind: 'cancelled'; stderr: Uint8Array; stdout: Uint8Array }
+  | { kind: 'cancelled'; order?: Order; stderr: Uint8Array; stdout: Uint8Array }
 
 export type Budget = {
   cpuMs: number
@@ -825,10 +828,12 @@ function decodeRan(bytes: Uint8Array): Ran {
     const why = u32()
     missing.push({ module, package: why === 0, text: text.decode(field()) })
   }
-  if (tag === 0) return { kind: 'exited', status: value | 0, stderr, stdout }
+  const order: number[] = []
+  if (at < bytes.length) for (let count = u32(); count > 0; count--) order.push(u32(), u32())
+  if (tag === 0) return { kind: 'exited', order, status: value | 0, stderr, stdout }
   if (tag === 1) return { kind: 'needs', missing }
-  if (tag === 2) return { kind: 'refused', limit: value, stderr, stdout, steps, held, asked }
-  return { kind: 'cancelled', stderr, stdout }
+  if (tag === 2) return { kind: 'refused', limit: value, order, stderr, stdout, steps, held, asked }
+  return { kind: 'cancelled', order, stderr, stdout }
 }
 
 type RunOptions = {
@@ -953,8 +958,21 @@ export function report(
   ran: Exclude<Ran, { kind: 'needs' }>,
   budget: Budget,
 ): number {
-  ctx.stdout.write(decode(ran.stdout))
-  ctx.stderr.write(decode(ran.stderr))
+  let atOut = 0
+  let atErr = 0
+  const order = ran.order ?? []
+  for (let i = 0; i + 1 < order.length; i += 2) {
+    const len = order[i + 1] ?? 0
+    if (order[i] === 2) {
+      ctx.stderr.write(decode(ran.stderr.subarray(atErr, atErr + len)))
+      atErr += len
+    } else {
+      ctx.stdout.write(decode(ran.stdout.subarray(atOut, atOut + len)))
+      atOut += len
+    }
+  }
+  if (atOut < ran.stdout.length) ctx.stdout.write(decode(ran.stdout.subarray(atOut)))
+  if (atErr < ran.stderr.length) ctx.stderr.write(decode(ran.stderr.subarray(atErr)))
   if (ran.kind === 'exited') return ran.status
   if (ran.kind === 'cancelled') throw new CommandError('interrupted', 130)
   const limit = limits[ran.limit]

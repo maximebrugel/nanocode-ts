@@ -296,7 +296,14 @@ fn request(input: &[u8]) -> (Run, Shell) {
     (run, shell)
 }
 
-fn respond(ended: &Ended, stdout: &[u8], stderr: &[u8], steps: u64, held: Held) -> Vec<u8> {
+fn respond(
+    ended: &Ended,
+    stdout: &[u8],
+    stderr: &[u8],
+    order: &[(u8, usize)],
+    steps: u64,
+    held: Held,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(stdout.len() + stderr.len() + 64);
     let (tag, value) = match ended {
         Ended::Exited(code) => (0, code.cast_unsigned()),
@@ -336,6 +343,11 @@ fn respond(ended: &Ended, stdout: &[u8], stderr: &[u8], steps: u64, held: Held) 
             Why::Machine => 1,
         }));
         put(&mut out, missing.to_string().as_bytes());
+    }
+    out.extend_from_slice(&u32::try_from(order.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for &(fd, len) in order {
+        out.extend_from_slice(&u32::from(fd).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes());
     }
     out
 }
@@ -385,12 +397,12 @@ pub extern "C" fn python_run() -> usize {
                 Ok(python) => kept.insert(python),
                 Err(error) => {
                     let said = format!("python3: cannot start: {error}\n");
-                    return respond(&Ended::Exited(1), &[], said.as_bytes(), 0, Held::default());
+                    return respond(&Ended::Exited(1), &[], said.as_bytes(), &[], 0, Held::default());
                 }
             },
         };
         let ran = python.run(run, Rc::new(shell));
-        respond(&ran.ended, &ran.stdout, &ran.stderr, ran.steps, ran.held)
+        respond(&ran.ended, &ran.stdout, &ran.stderr, &ran.order, ran.steps, ran.held)
     });
     let len = out.len();
     OUTPUT.set(out);

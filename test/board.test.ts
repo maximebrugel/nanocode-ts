@@ -196,7 +196,7 @@ if (process.env.NC_BOARD_CHILD) {
         const reopened = await open(path, 'bob')
         const [opened] = await reopened.board.opened()
         // The checkpoint covers every row alice wrote, so the reopen folds no tail.
-        assert.equal(opened?.from, 'checkpoint', JSON.stringify(opened))
+        assert.ok(opened?.from === 'checkpoint', JSON.stringify(opened))
         assert.equal(opened.tail, 0)
         assert.ok(opened.seq > 2)
         const restored = await reopened.board.tasks(t)

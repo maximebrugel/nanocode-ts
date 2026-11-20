@@ -90,7 +90,7 @@ def sse_lines(node, path, token, timeout, holder=None, headers=None):
             yield response.status, None
             return
         while True:
-            raw = response.fp.readline()
+            raw = response.readline()  # decodes chunked transfer; response.fp would not
             if not raw:
                 return
             yield 200, raw.decode(errors="replace").rstrip("\r\n")
@@ -352,6 +352,7 @@ def recheck(node, thread, token, timeout=5.0):
         for code, line in sse_lines(node, "/v1/threads/%s/events" % thread, token, timeout):
             if code != 200:
                 return {"http": code}
+            status.setdefault("_reached", True)
             if line.startswith("data:"):
                 data.append(line[5:].lstrip())
             elif not line and data:
@@ -360,17 +361,22 @@ def recheck(node, thread, token, timeout=5.0):
                 body = frame.get("data") or {}
                 if frame.get("type") == "turn.updated" and body.get("id"):
                     status[body["id"]] = body.get("status")
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as error:
+        if "_reached" not in status:
+            return {"unreachable": type(error).__name__}
+    status.pop("_reached", None)
     return status
 
 
 def board_poll(node, token, stop, seen):
     after = 0
-    status, body = http("GET", node + "/v1/board/events?after=0&limit=500", token)
-    while status == 200 and isinstance(body, dict) and body.get("events"):
-        after = body.get("last") or after
-        status, body = http("GET", node + "/v1/board/events?after=%d&limit=500" % after, token)
+    try:
+        status, body = http("GET", node + "/v1/board/events?after=0&limit=500", token)
+        while status == 200 and isinstance(body, dict) and body.get("events"):
+            after = body.get("last") or after
+            status, body = http("GET", node + "/v1/board/events?after=%d&limit=500" % after, token)
+    except OSError as error:
+        seen["start_error"] = str(error)[:200]
     seen["start_seq"] = after
     while not stop.is_set():
         try:
@@ -469,7 +475,9 @@ def main():
         st = recheck(node, thread, args.token)
         never.append({"thread": thread, "sent_s": sent_rel, "statuses": st})
     ended_states = ("succeeded",) + ENDED_BADLY
-    still = sum(1 for n in never if "http" in n["statuses"] or not any(v in ended_states for v in n["statuses"].values()))
+    unknown = sum(1 for n in never if "unreachable" in n["statuses"] or "http" in n["statuses"])
+    still = sum(1 for n in never if "unreachable" not in n["statuses"] and "http" not in n["statuses"]
+                and not any(v in ended_states for v in n["statuses"].values()))
     turns = run.turns_done * (1 + args.children)
     minutes = []
     for m in sorted(run.minutes):
@@ -489,7 +497,7 @@ def main():
         "child_run_ms": dist(run.child_run), "root_turn_ms": dist(run.root),
         "threads_by_node": run.threads_by_node, "errors": run.errors, "error_samples": run.samples,
         "http_5xx": run.http5xx, "retries": run.retries, "sse": run.sse, "stuck_slots": stuck_slots,
-        "unsettled": {"timed_out": len(run.unsettled), "never_settled_after_run": still, "rechecked": never[:20]},
+        "unsettled": {"timed_out": len(run.unsettled), "never_settled_after_run": still, "recheck_unreachable": unknown, "rechecked": never[:20]},
         "client_drain_s": round(max(run.ends) - (t0 + args.duration), 2) if run.ends else None,
         "drain": drain, "active_baseline": {"n": len(baseline), "max": max(baseline) if baseline else None},
         "per_minute": minutes, "board": board, "metrics_delta": delta(before, after)}), flush=True)

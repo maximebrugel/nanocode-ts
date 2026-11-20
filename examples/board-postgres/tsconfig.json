@@ -6,5 +6,5 @@
       "nanocode-ts/postgres": ["../../src/postgres/index.ts"]
     }
   },
-  "include": ["index.ts", "worker.ts"]
+  "include": ["index.ts", "worker.ts", "soak.ts"]
 }

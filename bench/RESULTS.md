@@ -154,6 +154,48 @@ six with [min–max], zero violations in all 72 runs:
   rounds (0.30–0.84) with a higher p99, which nothing above explains. Rerun on a quiet host before relying on
   either direction.
 
+**Quiet host (round D).** 25 ms poll only, on a second 48-core AMD EPYC host whose load average was 2–4 before
+the runs. The bench and Postgres 16 ran pinned to an 8-core bench lease there (`taskset`), so the bench's own
+workers took the load average to 9–16 while it ran. Four variants, order rotated each round: off and new are
+da67085 (new = the wake as merged, fdd23c7 plus later commits that leave the wake untouched), old is 5eb7feb,
+and rev is da67085 with fdd23c7 reverted. Node 22.23.5. The plan was six rounds per cell, but the host's CPU governor
+began moving processes off leased cores after the second round and then the cores went to another job, so only
+the 19 cells that finished before that are here. Medians with [min–max] and the run count, zero violations in
+all 19:
+
+| partitions | wake | runs | claims/s | task p99 ms | polls per claim |
+|---|---|---|---|---|---|
+| 1 | off | 2 | 570 [569–572] | 684 [684–684] | 0.72 |
+| 1 | old | 3 | 534 [492–537] | 710 [699–814] | 0.84 |
+| 1 | new | 2 | 512 [511–512] | 754 [753–755] | 0.80 |
+| 1 | rev | 1 | 541 | 702 | 0.86 |
+| 8 | off | 3 | 643 [643–646] | 693 [684–736] | 0.75 |
+| 8 | old | 4 | 628 [616–631] | 684 [674–707] | 0.91 |
+| 8 | new | 3 | 586 [583–590] | 748 [742–758] | 0.85 |
+| 8 | rev | 1 | 626 | 673 | 0.92 |
+
+- **The new wake's regression is real, and fdd23c7 is all of it.** Pinned, cells repeat within 1–2% (one old
+  run at 1 partition, 492 claims/s, is the outlier), against 2–20× in round C. At 8 partitions the new
+  wake does 6.6% fewer claims/s than the old (586 against 628) with p99 up 64 ms, below the old in each of the
+  three rounds it ran. At 1 partition it is 4.1% fewer (512 against 534). Reverting fdd23c7 alone brings both
+  cells back to the old wake (626 and 541).
+- **Round B's 15% wake cost at 1 partition does not hold.** The old wake costs 6.4% against off at 1 partition
+  (534 against 570) and 2.3% at 8. The new wake costs 10.3% and 8.8%.
+- **The cost is CPU, not lost wakes.** Polls per claim fall as intended (0.91 → 0.85 at 8 partitions), yet
+  throughput falls too. fdd23c7 passes `own`'s reach to `Sql.open`'s transaction through an
+  `AsyncLocalStorage`, and on Node 22 the first `run` turns on async_hooks promise hooks for the whole process.
+  In a loop of awaits on two pinned cores of the same host, one `run` made the loop 2.7× slower (26 → 71 ms
+  median over three runs each), and `--experimental-async-context-frame` brought it back to 26 ms. The bench
+  keeps its 8 cores busy with the runtime and postgres.js, both promise-heavy, so that tax comes off claims/s.
+  Wake off never subscribes, so `own` never calls `run` and pays nothing.
+- **Fix: carry the reach explicitly, without `AsyncLocalStorage`.** Have `Board`'s claim, renew, heed, finish
+  and release take a reach that rides the board request to `host.transaction` as an argument, and have
+  `Sql.open` read it there. That also closes a leak in the current design: `fire`'s debounce timer is set
+  inside the writer's `run`, so the pool it wakes runs its next tick, and everything that tick starts, inside
+  the writer's `{ reach: 'others', from }`. Any write there outside `own` would skip waking the writer's
+  pool. Until then, Node 24 and later (where AsyncContextFrame is the default) or
+  `--experimental-async-context-frame` on Node 22 should remove the cost. Neither was benched here.
+
 ## Reproduce
 
 ```sh

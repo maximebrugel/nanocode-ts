@@ -182,6 +182,11 @@ async function metrics(s: S) {
     return { t: Date.now(), heapMB: Math.round(m.JSHeapUsedSize / 1e5) / 10, nodes: m.Nodes, listeners: m.JSEventListeners, dom }
   }
 }
+async function pane(p: any, timeout = 20_000) {
+  const ok = await p.locator('[role="log"] article').first().waitFor({ timeout }).then(() => true, () => false)
+  const dialog = (await p.locator('[role="dialog"]').first().innerText({ timeout: 2000 }).catch(() => '<no dialog>')) as string
+  return { rendered: ok, dialog: dialog.replace(/\s+/g, ' ').slice(0, 300) }
+}
 async function closeAll(ss: S[]) {
   await Promise.all(ss.map((s) => s.context.close().catch(() => {})))
 }
@@ -215,9 +220,13 @@ async function basic() {
   const threadLinks = await s.page.locator('a[href^="/t/"]').count()
   await shot(s.page, 'basic-1-root')
   await s.page.goto(WEB + '/?open=' + encodeURIComponent(watched), { waitUntil: 'load' })
-  await s.page.locator('[role="log"] article').first().waitFor({ timeout: 30_000 })
-  await watch(s.page)
+  const pv = await pane(s.page, 30_000)
   await shot(s.page, 'basic-2-thread')
+  if (!pv.rendered) {
+    await s.context.close()
+    return { thread_links_on_root: threadLinks, thread_pane: pv }
+  }
+  await watch(s.page)
   const mark = 'ui' + randomUUID().slice(0, 8)
   await want(s.page, [mark])
   const composer = s.page.getByLabel('Steer this thread')
@@ -243,7 +252,7 @@ async function fanout(n: number) {
   const ss = await Promise.all(Array.from({ length: n }, (_, i) => session('f' + n + '-' + i)))
   const t0 = Date.now()
   await Promise.all(ss.map((s) => open(s, '/?open=' + encodeURIComponent(watched))))
-  await Promise.all(ss.map((s) => s.page.locator('[role="log"] article').first().waitFor({ timeout: 60_000 })))
+  const panes = await Promise.all(ss.map((s) => pane(s.page, 30_000)))
   const loadMs = Date.now() - t0
   await Promise.all(ss.map((s) => watch(s.page)))
   const thr: number[] = [], trn: number[] = [], miss: string[] = []
@@ -277,13 +286,13 @@ async function fanout(n: number) {
   await shot(ss[0].page, 'fanout' + n + '-s0')
   const chips = await Promise.all(ss.map((s) => chip(s.page)))
   await closeAll(ss)
-  return { sessions: n, initial_load_ms: loadMs, new_thread_ms: dist(thr), new_turn_ms: dist(trn), misses: miss.slice(0, 40), miss_count: miss.length, user_message_not_exactly_once: dups.slice(0, 40), chips_not_synced: chips.filter((c) => !/^Synced/.test(c)) }
+  return { sessions: n, panes_rendered: panes.filter((x) => x.rendered).length, pane_sample: panes[0], initial_load_ms: loadMs, new_thread_ms: dist(thr), new_turn_ms: dist(trn), misses: miss.slice(0, 40), miss_count: miss.length, user_message_not_exactly_once: dups.slice(0, 40), chips_not_synced: chips.filter((c) => !/^Synced/.test(c)) }
 }
 
 async function blip() {
   const ss = await Promise.all(Array.from({ length: 4 }, (_, i) => session('blip-' + i)))
   await Promise.all(ss.map((s) => open(s, '/?open=' + encodeURIComponent(watched))))
-  await Promise.all(ss.map((s) => s.page.locator('[role="log"] article').first().waitFor({ timeout: 60_000 })))
+  const panes = await Promise.all(ss.map((s) => pane(s.page, 30_000)))
   await Promise.all(ss.map((s) => watch(s.page)))
   for (const s of ss) {
     blocked.add(s.name)
@@ -329,13 +338,14 @@ async function blip() {
   const chips = await Promise.all(ss.map((s) => chip(s.page)))
   await shot(ss[0].page, 'blip-2-back')
   await closeAll(ss)
-  return { offline_chips: offChips, catch_up_ms: catchUp, missing: all.map((x) => [...marks, ...thr].filter((m) => x[m] == null).length), user_message_not_exactly_once: counts, stuck: st, chips }
+  return { panes_rendered: panes.filter((x) => x.rendered).length, offline_chips: offChips, catch_up_ms: catchUp, missing: all.map((x) => [...marks, ...thr].filter((m) => x[m] == null).length), user_message_not_exactly_once: counts, stuck: st, chips }
 }
 
 async function reload() {
   const s = await session('reload')
   await open(s, '/?open=' + encodeURIComponent(watched))
-  await s.page.locator('[role="log"] article').first().waitFor({ timeout: 30_000 })
+  const pv = await pane(s.page, 30_000)
+  if (!pv.rendered) throw new Error('thread pane did not render: ' + JSON.stringify(pv))
   const m = 'rl' + randomUUID().slice(0, 8)
   await watch(s.page)
   await want(s.page, [m])
@@ -395,7 +405,7 @@ async function subagents() {
 async function soak() {
   const s = await session('soak')
   await open(s, '/?open=' + encodeURIComponent(watched))
-  await s.page.locator('[role="log"] article').first().waitFor({ timeout: 30_000 })
+  const pv = await pane(s.page, 30_000)
   const sample = await metrics(s)
   const samples = [await sample()]
   const end = Date.now() + Math.min(SOAK_MS, DEADLINE - Date.now() - 120_000)
@@ -407,7 +417,7 @@ async function soak() {
     step('soak ' + JSON.stringify(samples[samples.length - 1]))
   }
   await shot(s.page, 'soak-end')
-  const res = { minutes: Math.round((samples[samples.length - 1].t - samples[0].t) / 600) / 100, first: samples[0], last: samples[samples.length - 1], max_heap_mb: Math.max(...samples.map((x) => x.heapMB)), max_dom: Math.max(...samples.map((x) => x.dom)), samples, chip: await chip(s.page), after: await stuck(s.page) }
+  const res = { pane: pv, minutes: Math.round((samples[samples.length - 1].t - samples[0].t) / 600) / 100, first: samples[0], last: samples[samples.length - 1], max_heap_mb: Math.max(...samples.map((x) => x.heapMB)), max_dom: Math.max(...samples.map((x) => x.dom)), samples, chip: await chip(s.page), after: await stuck(s.page) }
   await s.context.close()
   return res
 }

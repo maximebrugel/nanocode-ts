@@ -236,56 +236,78 @@ fn unknown(board: u32) -> String {
     format!("board {board} is not open")
 }
 
-fn route(boards: &[Board], by: Option<&str>, op: Op) -> Result<(usize, Op), String> {
+fn route(boards: &[Board], by: Option<&str>, op: Op) -> Result<(Vec<usize>, Op), String> {
     let writer = boards.first().ok_or("the board has no partitions")?.writer();
     let merged = Merged::new(boards.iter().map(Board::fold).collect());
     match merged.place(by.unwrap_or(writer), op) {
-        (Route::One(partition), op) => Ok((partition.0 as usize, op)),
-        (Route::Every, _) => Err("a write to every partition is not supported".into()),
+        (Route::One(partition), op) => Ok((vec![partition.0 as usize], op)),
+        (Route::Every, op) => Ok(((0..boards.len()).collect(), op)),
         (Route::Cross { .. }, _) => Err("a move across partitions is not supported".into()),
         (Route::Refused(reason), _) => Err(reason),
     }
 }
 
+fn merge(verdicts: Vec<Value>) -> Value {
+    let mut first = Value::Null;
+    for verdict in verdicts {
+        if verdict.get("ok") == Some(&Value::Bool(false)) {
+            return verdict;
+        }
+        if first.is_null() {
+            first = verdict;
+        }
+    }
+    first
+}
+
 async fn submit(boards: &mut [Board], write: Write) -> Result<Value, String> {
-    let (partition, op) = route(boards, write.by.as_deref(), write.op)?;
-    let board = boards
-        .get_mut(partition)
-        .ok_or("the write routes to a missing partition")?;
-    let applied = match (write.by, write.key) {
-        (None, Some(key)) => board.submit_keyed(&key, write.at_ms, op).await,
-        (None, None) => board.submit(write.at_ms, op).await,
-        (by, key) => board
-            .submit_group(vec![nanocode_board::Write {
-                at_ms: write.at_ms,
-                by,
-                key,
-                op,
-            }])
-            .await
-            .0
-            .pop()
-            .unwrap_or_else(|| Err(BoardError::Dropped("the group returned no verdict".into()))),
-    };
-    verdict(board, applied)
+    let (partitions, op) = route(boards, write.by.as_deref(), write.op)?;
+    let mut verdicts = Vec::with_capacity(partitions.len());
+    for partition in partitions {
+        let board = boards
+            .get_mut(partition)
+            .ok_or("the write routes to a missing partition")?;
+        let op = op.clone();
+        let applied = match (write.by.clone(), write.key.clone()) {
+            (None, Some(key)) => board.submit_keyed(&key, write.at_ms, op).await,
+            (None, None) => board.submit(write.at_ms, op).await,
+            (by, key) => board
+                .submit_group(vec![nanocode_board::Write {
+                    at_ms: write.at_ms,
+                    by,
+                    key,
+                    op,
+                }])
+                .await
+                .0
+                .pop()
+                .unwrap_or_else(|| {
+                    Err(BoardError::Dropped("the group returned no verdict".into()))
+                }),
+        };
+        verdicts.push(verdict(board, applied)?);
+    }
+    Ok(merge(verdicts))
 }
 
 async fn group(boards: &mut [Board], writes: Vec<Write>) -> Result<Vec<Value>, String> {
     let count = writes.len();
     let mut placed: BTreeMap<usize, Vec<(usize, nanocode_board::Write)>> = BTreeMap::new();
     for (index, write) in writes.into_iter().enumerate() {
-        let (partition, op) = route(boards, write.by.as_deref(), write.op)?;
-        placed.entry(partition).or_default().push((
-            index,
-            nanocode_board::Write {
-                at_ms: write.at_ms,
-                by: write.by,
-                key: write.key,
-                op,
-            },
-        ));
+        let (partitions, op) = route(boards, write.by.as_deref(), write.op)?;
+        for partition in partitions {
+            placed.entry(partition).or_default().push((
+                index,
+                nanocode_board::Write {
+                    at_ms: write.at_ms,
+                    by: write.by.clone(),
+                    key: write.key.clone(),
+                    op: op.clone(),
+                },
+            ));
+        }
     }
-    let mut verdicts = vec![Value::Null; count];
+    let mut verdicts: Vec<Vec<Value>> = vec![Vec::new(); count];
     for (partition, members) in placed {
         let board = boards
             .get_mut(partition)
@@ -295,11 +317,11 @@ async fn group(boards: &mut [Board], writes: Vec<Write>) -> Result<Vec<Value>, S
         let (results, _) = board.submit_group(members).await;
         for (index, result) in indices.into_iter().zip(results) {
             if let Some(slot) = verdicts.get_mut(index) {
-                *slot = verdict(board, result)?;
+                slot.push(verdict(board, result)?);
             }
         }
     }
-    Ok(verdicts)
+    Ok(verdicts.into_iter().map(merge).collect())
 }
 
 fn verdict(board: &Board, applied: Result<Applied, BoardError>) -> Result<Value, String> {

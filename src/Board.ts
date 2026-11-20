@@ -110,12 +110,19 @@ export type Lease = {
   readonly signal: AbortSignal
 }
 
+export type Can = 'read' | 'post' | 'react' | 'label' | 'sync' | 'rank' | 'manage' | 'plan'
+
+export type Who = { kind: 'principal'; id: string } | { kind: 'kind'; id: string } | { kind: 'everyone' }
+
+export type Grant = { who: Who[]; can: Record<string, Can[]> }
+
 export type Options = {
   sql: Contracts.SqlHost
   scope: string
   actor: string
   partitions?: number
   module?: WebAssembly.Module
+  charter?: boolean
 }
 
 export type MemorySql = Contracts.SqlHost & { close(): void }
@@ -154,6 +161,9 @@ export type Board = {
   tasks(atMs?: number): Promise<Task[]>
   held(atMs?: number): Promise<Task[]>
   refresh(): Promise<void>
+  charter(atMs?: number): Promise<Verdict>
+  grant(grant: Grant, options?: { key?: string; atMs?: number }): Promise<Verdict>
+  revoke(event: string, options?: { key?: string; atMs?: number }): Promise<Verdict>
   submit(op: RawOp, options?: { key?: string; by?: string; atMs?: number }): Promise<Verdict>
   group(writes: Write[]): Promise<Verdict[]>
   work(
@@ -172,7 +182,15 @@ export async function open(options: Options): Promise<Board> {
     const board = (await runtime.board({
       open: { scope: options.scope, actor: options.actor, partitions: options.partitions ?? 1 },
     })) as number
-    return wrap(runtime, board, options)
+    const opened = wrap(runtime, board, options)
+    if ((options.charter ?? true) && !options.actor.includes('+')) {
+      const chartered = await opened.charter()
+      if (!chartered.ok && chartered.rejection.kind !== 'Exists') {
+        await opened.close()
+        throw new Error('could not charter ' + options.scope + ': ' + JSON.stringify(chartered.rejection))
+      }
+    }
+    return opened
   } catch (error) {
     await runtime.dispose()
     throw error
@@ -182,7 +200,7 @@ export async function open(options: Options): Promise<Board> {
 type Sqlite = {
   DatabaseSync: new (path: string) => {
     prepare(query: string): {
-      setReturnArrays(enabled: boolean): void
+      setReturnArrays?(enabled: boolean): void
       all(...values: unknown[]): unknown[]
     }
     exec(query: string): void
@@ -199,16 +217,19 @@ export async function memorySql(): Promise<MemorySql> {
     let statement = prepared.get(query)
     if (!statement) {
       statement = db.prepare(query)
-      statement.setReturnArrays(true)
+      statement.setReturnArrays?.(true)
       prepared.set(query, statement)
     }
     return statement
   }
   const all = (statements: Contracts.Statement[]) =>
-    statements.map(
-      ([query, ...values]) =>
-        prepare(query).all(
+    statements.map(([query, ...values]) =>
+      prepare(query)
+        .all(
           ...values.map((value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value)),
+        )
+        .map((row) =>
+          Array.isArray(row) ? row : Object.values(row as Record<string, Contracts.SqlValue>),
         ) as Contracts.SqlValue[][],
     )
   return {
@@ -332,6 +353,18 @@ function wrap(runtime: AgentRuntime.AgentRuntime, board: number, options: Option
 
     async refresh() {
       await call({ refresh: { board } })
+    },
+
+    charter(atMs) {
+      return write({ op: 'charter' }, { atMs, key: 'charter' })
+    },
+
+    grant(grant, at) {
+      return write({ op: 'grant', grant }, at)
+    },
+
+    revoke(event, at) {
+      return write({ op: 'revoke', grant: event }, at)
     },
 
     submit(op, at) {

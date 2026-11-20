@@ -1111,3 +1111,11 @@ Measured on one 8-core lease of an AMD EPYC 9254 host, 8 workers, default flags,
 | Postgres | 8 | 524 | 1,355 ms | 431 | 27.5% |
 
 Postgres does not remove append races: they come from every worker appending at the same log tail, and a write that takes 0.36 ms (p50) instead of SQLite's 0.05 ms widens the window, so one partition loses 75% of its appends and runs a third slower than SQLite on one host. Partitions are what spread the tails, and on Postgres they pay off (454 to 524 claims/s, races 747 to 431 per 1,000) where on one SQLite file they cost more than they give. The gain Postgres brings is that the workers can be on different machines; a board that stays on one host is faster on SQLite.
+
+## 2026-11-20: the CI and release workflows are kept but dormant; releases are built on a box and published by hand
+
+`.github/workflows/ci.yml` and `.github/workflows/release.yml` stay in the repository, but GitHub Actions is off for nanocodexyz by the owner's choice, so neither runs. AGENTS.md says so, in place of the earlier "There is no CI".
+
+Releases are made by hand today. On a shared build box (under an nc-build lease), from a clean checkout of the pushed master commit, `scripts/release.mjs` removes `dist`, runs `npm ci --ignore-scripts`, builds and uploads the WASM assets with `scripts/build.mjs` and `scripts/publish-wasm.mjs --upload` only when the `wasm-<fingerprint>` release does not exist yet, runs `npm run prepare` and `npm run check:types`, and packs `nanocode-ts-<short>.tgz`. The tarball is then published from a machine with a GitHub token by `gh release create build-<short>` with the title and notes `scripts/release.mjs` writes: title `nanocode-ts <short>`, notes naming the commit, the SDK revision, the WASM build and the two install commands. Each release is checked by sha256 at every hop: box, coordinating machine and the published asset must show the same digest.
+
+Until Actions is turned on, nothing in the workflows is relied on.

@@ -1,2 +1,2 @@
-export * as Board from '../Board.ts'
+export * as Board from '../BoardPool.ts'
 export * as Sql from './Sql.ts'

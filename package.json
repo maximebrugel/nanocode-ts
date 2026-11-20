@@ -30,6 +30,10 @@
       "types": "./dist/vercel/Transport.d.ts",
       "default": "./dist/vercel/Transport.js"
     },
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    },
     "./cloudflare": {
       "types": "./dist/cloudflare/index.d.ts",
       "default": "./dist/cloudflare/index.js"

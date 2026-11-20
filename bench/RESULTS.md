@@ -290,6 +290,33 @@ splits the open into the SQL read of the log and the fold:
 Here open costs about 8.8 ms per 1k events (growth ratio 0.93 from 10k to 50k), half the loaded box's rate, and
 the SQL read is about 6% of it: the fold of the events into the board's state is the cost, not SQLite.
 
+### With fold checkpoints
+
+nanocode's `Board::open` restores the scope's newest fold checkpoint (the `nanocode_checkpoint` table) and folds
+only the rows after it. The replay phase at cf515e1 (nanocode dde42efe8) runs each size twice on the same object:
+**on** saves a checkpoint once (as a closing board does) and then wakes 5 times, each folding the few events the
+wakes before it wrote (12 by the fifth); **off** drops the checkpoints before every wake and opens with `checkpointEvery: 0`, so each
+wake replays the whole log as before. `pyramid-prd-bench-a5c1` (same CPU), 4 leased cores, with other jobs on the
+box. Medians of 5:
+
+| events | tasks | checkpoints | opened from | open ms | of which SQL read ms | first `tasks()` ms | first write ms | wake total ms | violations |
+|---|---|---|---|---|---|---|---|---|---|
+| 10,035 | 2,482 | on | checkpoint, tail 12 | 60.4 | 2 | 12.8 | 6.3 | 93 | 0 |
+| 10,050 | 2,487 | off | full replay | 90.7 | 6 | 20.4 | 5.6 | 130 | 0 |
+| 50,059 | 12,383 | on | checkpoint, tail 12 | 259 | 15 | 61.4 | 6.0 | 386 | 0 |
+| 50,074 | 12,388 | off | full replay | 440 | 26 | 85.3 | 6.5 | 601 | 0 |
+| 100,097 | 24,762 | on | checkpoint, tail 12 | 543 | 29 | 127 | 5.9 | 806 | 0 |
+| 100,112 | 24,767 | off | full replay | 902 | 56 | 174 | 4.8 | 1,222 | 0 |
+
+A checkpoint cuts the open by 33–41% and the whole wake by 28–36%, and the first `tasks()` gets cheaper too. It does
+not make the wake flat: open still grows with the board (growth ratios 0.86 and 1.05 with checkpoints, 0.97 and 1.03
+without), because restoring a checkpoint rebuilds every task the board holds, and in this workload every finished
+task stays on the board, about one per four events. A checkpoint is about 1.4 KB per task here: `databaseSize`
+grows from 20 MB to 55 MB at 100k events with one saved, against the log's 16 MB of bodies. An aborted object
+closes nothing, so a live Durable Object wakes from the checkpoint its board saved on its own (every 4,096 events
+by default) and folds up to that many more events than these wakes did; a first run of this phase that woke that
+way opened 10k events from seq 8,192 with a tail of 1,841 in 63 ms.
+
 ## Findings
 
 - **Correctness held everywhere.** 15,120 tasks over 6 load cells and 24,751 in the replay object: each finished
@@ -298,7 +325,9 @@ the SQL read is about 6% of it: the fold of the events into the board's state is
   per 1k events on the loaded box (8.8 on a quieter one), about 94% of it the fold rather than the SQL read, and
   the first full read another 3.2 ms per 1k. Since a swarm reopens the board on every wake, a
   wake costs 0.23 s at 10k events (about 120 swarms of 21 tasks), 1.16 s at 50k and 2.3 s at 100k before any
-  work. There is no snapshot or compaction, so a long-lived object pays for its whole history on each wake.
+  work. Fold checkpoints (above) take a third off that, but the restored state still grows with every task the
+  board has ever held, so a long-lived object still pays for its whole history on each wake until finished tasks
+  leave the board.
 - **`tasks()` is O(tasks)**: about 11 µs per task warm (282 ms at 24,751 tasks). A first write after a wake grows
   too, from 5 to 24 ms over 1k–100k events, three round trips included.
 - **Storage is about 200 KB per 1k events** (≈200 bytes per event), flat from 1k to 100k: the log bodies are
@@ -320,10 +349,10 @@ the SQL read is about 6% of it: the fold of the events into the board's state is
 ```sh
 npm ci && npm run build:ts
 npm run bench:board-do                                                # load (K = 1, 4, 16 × one, actors) and replay
-npm run bench:board-do -- --phases replay --sizes 10000,50000,100000  # wake cost against log size
+npm run bench:board-do -- --phases replay --sizes 10000,50000,100000  # wake cost against log size, with and without checkpoints
 npm run bench:board-do -- --phases load --modes actors --clients 4,16 # the many-handles drop at K = 16
 ```
 
-Flags: `--children`, `--clients`, `--lease-ms`, `--modes`, `--phases`, `--restarts`, `--seed`, `--sizes`,
-`--steer`, `--swarms`, `--keep true` (keep the workerd storage dir). Each run writes its JSON to
+Flags: `--checkpoints <on,off>` (replay), `--children`, `--clients`, `--lease-ms`, `--modes`, `--phases`, `--restarts`,
+`--seed`, `--sizes`, `--steer`, `--swarms`, `--keep true` (keep the workerd storage dir). Each run writes its JSON to
 `output/bench/board-do/`; the process exits 1 if any audit finds a violation.

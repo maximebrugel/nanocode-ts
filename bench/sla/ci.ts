@@ -241,7 +241,11 @@ function analyse(
   failures: readonly Failure[],
 ): Cell {
   const direction =
-    better === 'auto' ? (/tps$/.test(metric) ? 'higher' : 'lower') : (better as 'lower' | 'higher')
+    better === 'auto'
+      ? metric.endsWith('tps')
+        ? 'higher'
+        : 'lower'
+      : (better as 'lower' | 'higher')
   const arms = target === undefined ? [arm, vs] : [arm]
   const mine = cell.filter((sample) => arms.includes(sample.arm))
   const byRound = new Map<number, Map<string, number[]>>()

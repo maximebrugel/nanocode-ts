@@ -38,7 +38,7 @@ export const token = (turn: number, i: number, n: number) =>
   i === n - 1 ? marks(turn).last + '\n' : marks(turn).first + i + ((i + 1) % 16 === 0 ? '\n' : ' ')
 
 function scenario(body: string): Scenario {
-  const found = [...body.matchAll(/SLA\[([A-Za-z0-9_=,.\-]+)\]/g)].at(-1)
+  const found = [...body.matchAll(/SLA\[([A-Za-z0-9_=,.-]+)\]/g)].at(-1)
   const pairs = new Map(
     (found?.[1] ?? '').split(',').map((pair) => pair.split('=') as [string, string]),
   )

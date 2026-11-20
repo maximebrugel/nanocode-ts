@@ -315,9 +315,9 @@ const replies: readonly [RegExp, (match: RegExpExecArray) => string][] = [
   [/\x1b\[16t/g, () => '\x1b[6;20;10t'],
 ]
 const ansi =
-  /\x1b\[[0-9;?<>=!]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\|\x1b[()][0-9A-Za-z]|\x1b[=>78DEHMNOZc]/g
+  /\x1b\[[0-9;?<>=!]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\|\x1b[()][0-9A-Za-z]|\x1b[=>78DEHMNOZc]/g
 const noise = /[\s\x00-\x1f\x7f\u2800-\u28ff*·✢✳✶✻✽]/g
-const partial = /\x1b(?:\[[0-9;?<>=!]*[ -\/]*|\][^\x07\x1b]*\x1b?|P[^\x1b]*\x1b?|[()])?$/
+const partial = /\x1b(?:\[[0-9;?<>=!]*[ -/]*|\][^\x07\x1b]*\x1b?|P[^\x1b]*\x1b?|[()])?$/
 
 const contains = (text: string) => {
   const word = text.replace(/\s/g, '')

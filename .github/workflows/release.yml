@@ -13,11 +13,12 @@ concurrency:
 
 jobs:
   release:
+    name: Release
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
-      contents: write
+      contents: write # create the wasm-<fingerprint> and build-<commit> releases
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -101,7 +102,8 @@ jobs:
         run: df -h "$GITHUB_WORKSPACE"
 
   ci:
+    name: CI
     needs: release
     permissions:
       contents: read
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] the local form runs ci.yml at this run's commit

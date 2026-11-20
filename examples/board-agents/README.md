@@ -4,7 +4,7 @@ In [index.ts](index.ts), a planner posts a six-task graph on one SQLite file (`S
 
 When `ANTHROPIC_API_KEY` is set, each `kind=agent` task runs a nanocode-ts agent turn: an `AgentRuntime` session in memory per task, given the outcomes of the tasks it needs, on the model in `NANOCODE_MODEL` (default `claude-haiku-5-5`). Without a key those tasks run a deterministic stand-in, so the example needs no keys. `kind=tool` tasks always run the stand-in.
 
-A label cap of `{ max: 2, label: ['kind', 'agent'] }` allows at most two `kind=agent` tasks held at once across both pools. `Board.pool` claims without a cap, so each pool gets a board whose `claim` adds the cap for `kind=agent` tasks. The board counts every live lease on such tasks, whichever pool holds it. Since `check-links` is `kind=tool`, it runs beside two agent tasks.
+A label cap of `{ max: 2, label: ['kind', 'agent'] }` allows at most two `kind=agent` tasks held at once across both pools. Both pools pass it as `Board.pool`'s `cap` option, which applies it only to `kind=agent` tasks. The board counts every live lease on such tasks, whichever pool holds it. Since `check-links` is `kind=tool`, it runs beside two agent tasks.
 
 At the end it prints each task's phase, the worker that finished it (`Task.worker`) and its outcome, then each pool's `stats()`.
 

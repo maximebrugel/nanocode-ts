@@ -115,13 +115,10 @@ pub(crate) async fn execute(request: Request) -> Result<Value, String> {
         }),
         Request::Refresh { board } => {
             let mut boards = take(board)?;
-            let mut refreshed = Ok(Value::Null);
-            for partition in &mut boards {
-                if let Err(error) = partition.refresh().await {
-                    refreshed = Err(error.to_string());
-                    break;
-                }
-            }
+            let refreshed = shards::refresh(&mut boards)
+                .await
+                .map(|()| Value::Null)
+                .map_err(|error| error.to_string());
             put(board, boards);
             refreshed
         }

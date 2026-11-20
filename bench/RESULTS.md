@@ -67,6 +67,55 @@ Each cell ran 46–47 s of wall time; the whole matrix took 7.5 minutes.
 - At 16 workers many steers come back `Terminal` (89% at 1 partition, 33% at 8): the task finished before the
   steer landed. The bench counts those as expected, not as violations.
 
+## Waking pools on Postgres
+
+`Board.pool` takes `wake`, a subscription that makes the pool poll as soon as it fires, with `pollMs` kept as
+the fallback. On Postgres, `nanocode-ts/postgres` gives one: every host sends `pg_notify('nanocode_log', <schema>)`
+after it commits a write to `nanocode_log` (at most one every `notifyMs`, 10 ms by default), and `Sql.wake(host)`
+LISTENs on that channel and calls the pool once per 5 ms burst. node:sqlite has no cross-process notify, so pools
+there leave `wake` unset and keep polling.
+
+**Idle pools** (`test/board-pool-wake.test.ts`): two processes, each a pool with `pollMs` 5000, drain 20 tasks
+(10 roots and 10 that need one) posted after both are idle. With `wake` they finish in 74 ms and 80 ms (two runs);
+without it they wait for the next poll, 4,976 ms and 5,001 ms.
+
+**Busy pools** (`npm run bench:board -- --sql postgres --workers 8 --partitions 1,8 --poll-ms <25|1000>
+--wake <off|on>`): Postgres 16 on loopback in an 8-core lease of a 48-core AMD EPYC host shared with other jobs,
+default flags otherwise, zero violations in every cell. Two rounds on 2026-11-20: round A sent one notification per
+committed write (0d9bb85), round B is the throttled sender that landed.
+
+| round | poll ms | partitions | wake | claims/s | task p50 / p99 ms |
+|---|---|---|---|---|---|
+| A | 25 | 1 | off | 448.9 | 383 / 1,273 |
+| A | 25 | 1 | on | 373.1 | 468 / 1,059 |
+| A | 25 | 8 | off | 528.9 | 276 / 1,183 |
+| A | 25 | 8 | on | 533.9 | 290 / 827 |
+| A | 1000 | 1 | off | 289.5 | 594 / 1,983 |
+| A | 1000 | 1 | on | 170.0 | 596 / 2,720 |
+| A | 1000 | 8 | off | 434.6 | 338 / 1,527 |
+| A | 1000 | 8 | on | 413.0 | 347 / 1,481 |
+| B | 25 | 1 | off | 441.6 | 364 / 1,105 |
+| B | 25 | 1 | on | 375.3 | 448 / 1,121 |
+| B | 25 | 8 | off | 461.2 | 322 / 1,169 |
+| B | 25 | 8 | on | 502.8 | 305 / 851 |
+| B | 1000 | 1 | off | 388.4 | 448 / 1,414 |
+| B | 1000 | 1 | on | 340.0 | 461 / 1,044 |
+| B | 1000 | 8 | off | 406.0 | 365 / 1,467 |
+| B | 1000 | 8 | on | 485.4 | 310 / 967 |
+
+- **Wake matters when pools wait, not when they are full.** The bench keeps every pool busy (16 tasks in flight
+  for 4 slots each), a pool polls whenever a run ends, and a full pool ignores wakes, so `pollMs` barely sets
+  latency there: without wake, 1000 ms instead of 25 ms costs 12–35% of throughput, not a second per task.
+- **At 8 partitions wake lowers the tail.** Task p99 falls 27–34% (1,169 → 851 and 1,467 → 967 ms in round B) and
+  throughput holds or rises (461 → 503, 406 → 485 claims/s).
+- **At 1 partition wake costs throughput.** Every worker appends at the same log tail, and polls woken by the
+  others' writes add to those races: 15% fewer claims/s in round B (442 → 375, 388 → 340) and p50 up 3–23%, though
+  p99 holds or falls. Round A's per-write notification was worse at `--poll-ms 1000` (290 → 170 claims/s, in a
+  cell whose read p99 was 63 ms against 6 ms elsewhere, so part of it is the shared host); the 10 ms throttle
+  landed after it.
+- Cells vary by up to a third between rounds on this shared host (1 partition, 1000 ms, off: 290 and 388
+  claims/s), so differences under about 15% in one round are noise.
+
 ## Reproduce
 
 ```sh
@@ -76,5 +125,6 @@ npm run bench:board -- --partitions 8 --workers 16          # one cell
 ```
 
 Flags: `--children`, `--concurrency`, `--inflight`, `--kill-every-ms`, `--lease-ms`, `--poll-ms`,
-`--post-ms`, `--drain-ms`, `--seed`, `--steer`, `--work-min-ms`, `--work-max-ms`. Each run writes its JSON to
+`--post-ms`, `--drain-ms`, `--seed`, `--steer`, `--work-min-ms`, `--work-max-ms`, `--sql <sqlite|postgres>`, and
+`--wake <off|on>` (Postgres only). Each run writes its JSON to
 `output/bench/board-load/`.

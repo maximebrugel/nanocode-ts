@@ -112,6 +112,7 @@ const errno: Record<string, number> = {
   ENOTDIR: 20,
   ENOTEMPTY: 39,
   ENOTSUP: 95,
+  EPERM: 1,
   EROFS: 30,
 }
 
@@ -233,20 +234,24 @@ async function instantiate(
   }
   const stat = new Uint8Array(24)
   const stats = new DataView(stat.buffer)
+  // Milliseconds, kept to the microsecond, as the nanoseconds since the epoch python reads.
+  const nanos = (mtime: number) => BigInt(Math.round(mtime * 1000)) * 1000n
+  const put = (entry: { kind: string; mode: number; size: number; mtime: number }) => {
+    stats.setUint32(0, entry.kind === 'directory' ? 1 : entry.kind === 'symlink' ? 2 : 0, true)
+    stats.setUint32(4, entry.mode, true)
+    stats.setBigUint64(8, BigInt(entry.size), true)
+    stats.setBigInt64(16, nanos(entry.mtime), true)
+    return reply(stat)
+  }
+  const exists = (files: SyncFileSystem, path: string) =>
+    (files.lstat ? files.lstat(path) : files.stat(path)) !== null
   const found = (files: SyncFileSystem, path: string): FileStat => {
     const entry = files.stat(path)
     if (!entry) throw new FsError('ENOENT', path)
     return entry
   }
   const ops: ((files: SyncFileSystem, path: string, data: Uint8Array, arg: bigint) => bigint)[] = [
-    (files, path) => {
-      const entry = found(files, path)
-      stats.setUint32(0, entry.kind === 'directory' ? 1 : 0, true)
-      stats.setUint32(4, entry.mode, true)
-      stats.setBigUint64(8, BigInt(entry.size), true)
-      stats.setBigInt64(16, BigInt(Math.trunc(entry.mtime)) * 1_000_000n, true)
-      return reply(stat)
-    },
+    (files, path) => put(found(files, path)),
     (files, path) => reply(files.read(path)),
     (files, path, data, how) => {
       if (how === 2n && files.stat(path)) throw new FsError('EEXIST', path)
@@ -263,12 +268,12 @@ async function instantiate(
         ),
       ),
     (files, path) => {
-      if (files.stat(path)) throw new FsError('EEXIST', path)
+      if (exists(files, path)) throw new FsError('EEXIST', path)
       files.mkdir(path)
       return 0n
     },
     (files, path, _data, what) => {
-      const entry = found(files, path)
+      const entry = files.lstat?.(path) ?? found(files, path)
       if (what === 0n && entry.kind === 'directory') throw new FsError('EISDIR', path)
       if (what === 1n && entry.kind !== 'directory') throw new FsError('ENOTDIR', path)
       if (what === 1n && files.list(path).length) throw new FsError('ENOTEMPTY', path)
@@ -284,6 +289,47 @@ async function instantiate(
       const offset = new DataView(data.buffer, data.byteOffset, 8).getBigUint64(0, true)
       const start = Math.min(all.length, Number(offset))
       return reply(all.subarray(start, Math.min(all.length, start + Number(len))))
+    },
+    (files, path, _data, mode) => {
+      if (!files.chmod) throw new FsError('ENOTSUP', path)
+      found(files, path)
+      files.chmod(path, Number(mode))
+      return 0n
+    },
+    (files, path, _data, mtimeNs) => {
+      if (!files.utimes) throw new FsError('ENOTSUP', path)
+      found(files, path)
+      files.utimes(path, Number(BigInt.asIntN(64, mtimeNs) / 1000n) / 1000)
+      return 0n
+    },
+    (files, path) => {
+      const entry = files.lstat ? files.lstat(path) : files.stat(path)
+      if (!entry) throw new FsError('ENOENT', path)
+      return put(entry)
+    },
+    (files, path, data) => {
+      if (!files.symlink) throw new FsError('ENOTSUP', path)
+      if (exists(files, path)) throw new FsError('EEXIST', path)
+      files.symlink(decode(data), path)
+      return 0n
+    },
+    (files, path) => {
+      const target = files.readlink?.(path)
+      if (target != null) return reply(encode(target))
+      throw new FsError(exists(files, path) ? 'EINVAL' : 'ENOENT', path)
+    },
+    (files, path, data) => {
+      if (!files.link) throw new FsError('ENOTSUP', path)
+      files.link(path, decode(data))
+      return 0n
+    },
+    (files, path, _data, follow) => {
+      const links = files.links?.(path, follow !== 0n)
+      if (!links) return reply(new Uint8Array(0))
+      const out = new DataView(new ArrayBuffer(16))
+      out.setBigUint64(0, BigInt(links[0]), true)
+      out.setBigUint64(8, BigInt(links[1]), true)
+      return reply(new Uint8Array(out.buffer))
     },
   ]
   const imports = {

@@ -479,8 +479,11 @@ async function replay(config: Config) {
     const fillMs = performance.now() - fillStarted
     const wake = { abort: [] as number[], boot: [] as number[], open: [] as number[] }
     const steps = {
+      claimInside: [] as number[],
       first: [] as number[],
       firstInside: [] as number[],
+      readSql: [] as number[],
+      readyInside: [] as number[],
       openInside: [] as number[],
       warm: [] as number[],
       write: [] as number[],
@@ -495,6 +498,9 @@ async function replay(config: Config) {
       const opened = await send<{ openMs: number }>(object, { method: 'open' })
       wake.open.push(opened.wallMs)
       steps.openInside.push(opened.value.openMs)
+      // The new instance's SQL time so far is the open's log read; the rest of the open is the fold.
+      const read = (await send<Operations>(object, { method: 'operations' })).value
+      steps.readSql.push(Object.values(read).reduce((sum, entry) => sum + entry.ms, 0))
       const first = await send<{ count: number; tasksMs: number }>(object, { method: 'tasks' })
       steps.first.push(first.wallMs)
       steps.firstInside.push(first.value.tasksMs)
@@ -511,6 +517,8 @@ async function replay(config: Config) {
         method: 'claim',
       })
       if (claimed.value.id !== id) throw new Error('the wake claim took ' + claimed.value.id)
+      steps.readyInside.push(claimed.value.readyMs ?? 0)
+      steps.claimInside.push(claimed.ms)
       const finished = await send<{ ok: boolean; rejection?: string }>(object, {
         claim: claimed.value.claim,
         client: 'lead',
@@ -543,6 +551,9 @@ async function replay(config: Config) {
         firstReadInsideMs: round(median(steps.firstInside)),
         firstReadMs: round(median(steps.first)),
         openInsideMs: round(median(steps.openInside)),
+        openReadSqlMs: round(median(steps.readSql)),
+        wakeClaimInsideMs: round(median(steps.claimInside)),
+        wakeReadyInsideMs: round(median(steps.readyInside)),
         openMs: round(median(wake.open)),
         openSamples: wake.open.map((ms) => round(ms, 1)),
         totalMs: round(median(steps.total)),

@@ -9,7 +9,9 @@ import { Board, Sql } from 'nanocode-ts/postgres'
 
 const url = process.env.DATABASE_URL
 if (!url) {
-  console.error('Set DATABASE_URL to a Postgres database, such as postgres://postgres@127.0.0.1:5432/postgres')
+  console.error(
+    'Set DATABASE_URL to a Postgres database, such as postgres://postgres@127.0.0.1:5432/postgres',
+  )
   process.exit(1)
 }
 
@@ -36,7 +38,10 @@ let failure: string | undefined
 
 try {
   const lead = await Board.open({ sql, scope, actor: 'agent:lead' })
-  const agents = { who: [{ kind: 'kind', id: 'agent' } as const], can: { '*': ['manage' as const] } }
+  const agents = {
+    who: [{ kind: 'kind', id: 'agent' } as const],
+    can: { '*': ['manage' as const] },
+  }
   const granted = await lead.grant(agents, { key: 'agents' }) // lets every agent: actor work here
   if (!granted.ok) throw new Error('grant refused: ' + JSON.stringify(granted.rejection))
 
@@ -80,13 +85,13 @@ try {
     if (line.e === 'done') log(name, `done   ${line.task}`, line.at)
   }
   for (const name of ['w1', 'w2', 'w3']) {
-    const child = spawn(process.execPath, [workerFile, JSON.stringify({ url, schema, scope, name })], {
-      stdio: ['pipe', 'pipe', 'inherit'],
-    })
+    const args = [workerFile, JSON.stringify({ url, schema, scope, name })]
+    const child = spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'inherit'] })
     const exited = new Promise<void>((resolve) => child.on('exit', () => resolve()))
     const worker = { name, child, exited }
     workers.push(worker)
-    createInterface({ input: child.stdout! }).on('line', (text) => heard(worker, JSON.parse(text) as Line))
+    const lines = createInterface({ input: child.stdout! })
+    lines.on('line', (text) => heard(worker, JSON.parse(text) as Line))
   }
 
   // Reads come from the local fold, so refresh before each look.
@@ -111,7 +116,9 @@ try {
     }
     if (tasks.every((task) => task.phase === 'done')) break
     if (Date.now() > deadline)
-      throw new Error('the board did not drain: ' + tasks.map((t) => t.id + '=' + t.stage).join(' '))
+      throw new Error(
+        'the board did not drain: ' + tasks.map((t) => t.id + '=' + t.stage).join(' '),
+      )
     await sleep(25)
   }
   log('lead', `peak   ${peak} agent=llm tasks held at once (cap 2)`)
@@ -123,8 +130,12 @@ try {
   for (const { at, who, what } of timeline.sort((a, b) => a.at - b.at))
     console.log(`+${String(at - t0).padStart(5)}ms  ${who.padEnd(4)}  ${what}`)
   console.log()
-  for (const task of await lead.tasks())
-    console.log(`${task.id.padEnd(10)} ${task.phase.padEnd(5)} ${String(task.worker).padEnd(9)} ${JSON.stringify(task.outcome)}`)
+  // Each finished task keeps the worker whose claim finished it.
+  for (const { id } of graph) {
+    const task = (await lead.task(id))!
+    const outcome = JSON.stringify(task.outcome)
+    console.log(`${id.padEnd(10)} ${task.phase}  ${String(task.worker).padEnd(9)} ${outcome}`)
+  }
   console.log()
   for (const { name } of workers) {
     const s = stats.get(name)

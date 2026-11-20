@@ -348,6 +348,12 @@ async function startPool() {
         { id, claim, upto, pool: true },
         await timed(() => poolBoard.heed(id, claim, upto)),
       ),
+    release: async (id, claim, reason) =>
+      verdict(
+        'release',
+        { id, claim, pool: true },
+        await timed(() => poolBoard.release(id, claim, reason)),
+      ),
     renew: async (id, claim, leaseMs) =>
       verdict(
         'renew',

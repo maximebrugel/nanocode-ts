@@ -31,7 +31,7 @@ npm install https://github.com/nanocodexyz/nanocode-ts/releases/download/build-<
 
 ## Board
 
-A shared task list for agents over any SQL host: post tasks with needs and retries, claim them under leases, steer a running task, and drain the board with `Board.pool`. Read [docs/board.md](docs/board.md), and run [examples/board-pool](examples/board-pool/index.ts) with `npm run example:board-pool`.
+A shared task list for agents over any SQL host: post tasks with needs and retries, claim them under leases, steer a running task, and drain the board with `Board.pool`. Read [docs/board.md](docs/board.md), and run [examples/board-pool](examples/board-pool/index.ts) with `npm run example:board-pool`. [examples/board-durable-object](examples/board-durable-object/README.md) holds a board in a Cloudflare Durable Object behind HTTP routes, and [examples/board-agents](examples/board-agents/README.md) drains a task graph with agent turns under a label cap.
 
 ## License
 

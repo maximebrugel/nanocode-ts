@@ -1,3 +1,9 @@
+// Browser e2e of pyramid2-web's live feed against a running pyramid2 (web on WEB, API on NODES[0]); run it with
+// test/e2e/pyramid2-web.run.sh, which takes the lease and drives bench/pyramid2-swarm.py beside it. Phases (PHASES):
+// auth, basic, fanout8, fanout32, blip, reload, subagents, soak. Browsers authenticate the live socket through a local
+// relay that adds the bearer header (a browser WebSocket cannot), keyed per session so blip can cut one session off.
+// Writes OUT/result.json (latencies p50/p99 from API post to DOM appearance, console errors and failed requests per
+// phase) and screenshots. The token is read from PYRAMID2_TOKEN_FILE and never printed.
 import { chromium } from 'playwright'
 import { WebSocketServer, WebSocket } from 'ws'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
@@ -97,8 +103,10 @@ async function session(name: string, live: string = proxy + '?s=' + name): Promi
   const context = await browser.newContext({ viewport: { width: 1280, height: 860 } })
   await context.addInitScript(
     ([t, l]: string[]) => {
-      sessionStorage.setItem('pyramid2-web.token', t)
-      sessionStorage.setItem('pyramid2-web.live', l)
+      try {
+        sessionStorage.setItem('pyramid2-web.token', t)
+        sessionStorage.setItem('pyramid2-web.live', l)
+      } catch {}
     },
     [token, live],
   )
@@ -107,7 +115,20 @@ async function session(name: string, live: string = proxy + '?s=' + name): Promi
   page.on('pageerror', (e: any) => log('pageerror', name + ': ' + e))
   page.on('requestfailed', (r: any) => log('requestfailed', name + ': ' + r.method() + ' ' + r.url().split('?')[0] + ' ' + r.failure()?.errorText))
   page.on('response', (r: any) => r.status() >= 400 && log('http', name + ': ' + r.status() + ' ' + r.request().method() + ' ' + r.url().split('?')[0]))
-  return { name, context, page }
+  const s = { name, context, page }
+  opened.add(s)
+  context.on('close', () => opened.delete(s))
+  return s
+}
+const opened = new Set<S>()
+async function evidence(tag: string) {
+  const out: any[] = []
+  for (const s of [...opened].slice(0, 3)) {
+    await shot(s.page, 'fail-' + tag + '-' + s.name)
+    const text = (await s.page.locator('body').innerText({ timeout: 3000 }).catch(() => '')) as string
+    out.push({ session: s.name, url: s.page.url().replace(/token=[^&]*/, 'token=x'), chip: await chip(s.page), body: text.replace(/\s+/g, ' ').slice(0, 700) })
+  }
+  return out
 }
 const chip = async (p: any) => ((await p.locator('[aria-label^="Connection:"]').first().innerText({ timeout: 5000 }).catch(() => '?')) as string).trim().replace(/\s+/g, ' ')
 const shot = (p: any, n: string) => p.screenshot({ path: OUT + '/' + n + '.png' }).catch(() => {})
@@ -409,8 +430,9 @@ try {
       result.phases[p] = { ok: true, ...(await run[p]()), ms: Date.now() - t }
     } catch (e: any) {
       failed = true
-      result.phases[p] = { ok: false, error: String(e?.stack ?? e).slice(0, 1500), ms: Date.now() - t }
+      result.phases[p] = { ok: false, error: String(e?.stack ?? e).slice(0, 1500), ms: Date.now() - t, evidence: await evidence(p).catch(() => []) }
     }
+    await closeAll([...opened])
     for (const [k, v] of frames) frames.delete(k), ((result.frames ??= {})[p + ':' + k] = v)
     step(JSON.stringify(result.phases[p]).slice(0, 1500))
     save()

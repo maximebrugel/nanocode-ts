@@ -252,7 +252,12 @@ export async function memorySql(): Promise<MemorySql> {
 
 function wrap(runtime: AgentRuntime.AgentRuntime, board: number, options: Options): Board {
   const now = (atMs?: number) => atMs ?? Date.now()
-  const call = (request: object) => runtime.board(request)
+  let queue: Promise<unknown> = Promise.resolve()
+  const call = (request: object) => {
+    const next = queue.then(() => runtime.board(request))
+    queue = next.catch(() => undefined)
+    return next
+  }
   const wire = (op: RawOp, at?: { atMs?: number; key?: string; by?: string }) => ({
     op,
     at_ms: now(at?.atMs),

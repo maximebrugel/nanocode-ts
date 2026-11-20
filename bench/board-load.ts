@@ -123,7 +123,8 @@ function swarm(cell: Cell, draw: () => number, name: string): Board.NewTask[] {
     else {
       const from = Math.max(0, index - shape.window)
       const count = 1 + Math.floor(draw() * shape.maxNeeds)
-      while (needs.size < count) needs.add(name + '.c' + (from + Math.floor(draw() * (index - from))))
+      while (needs.size < count)
+        needs.add(name + '.c' + (from + Math.floor(draw() * (index - from))))
     }
     tasks.push({
       id: name + '.c' + index,
@@ -177,7 +178,8 @@ function histogramQuantile(histogram: Histogram, q: number) {
   return null
 }
 
-const total = (histogram: Histogram) => Object.values(histogram).reduce((sum, count) => sum + count, 0)
+const total = (histogram: Histogram) =>
+  Object.values(histogram).reduce((sum, count) => sum + count, 0)
 
 const round = (value: number | null) => (value === null ? null : Math.round(value * 10) / 10)
 
@@ -249,11 +251,13 @@ function audit(path: string, cell: Cell, kills: ReadonlyMap<string, number>) {
         const unmet = (needsOf.get(id) ?? []).filter((need) => !finished.has(need))
         if (unmet.length > 0)
           violations.push('claim of ' + id + ' at ' + where + ' before needs ' + unmet.join(' '))
-        if (finishes.has(id)) violations.push('claim of ' + id + ' at ' + where + ' after its finish')
+        if (finishes.has(id))
+          violations.push('claim of ' + id + ' at ' + where + ' after its finish')
         const live = leases.get(id)
-        if (live && live.untilMs > clock)
+        const left = live ? live.untilMs - clock : 0
+        if (live && left > 0)
           violations.push(
-            'claim of ' + id + ' at ' + where + ' by ' + event.by + ' while ' + live.by + ' held it for ' + (live.untilMs - clock) + ' ms more',
+            `claim of ${id} at ${where} by ${event.by} while ${live.by} held it ${left} ms more`,
           )
         if (live) takeovers.push({ at: event.at_ms, from: live.by, id })
         leases.set(id, { by: event.by, untilMs: clock + (op.lease_ms ?? 0) })
@@ -265,7 +269,8 @@ function audit(path: string, cell: Cell, kills: ReadonlyMap<string, number>) {
         finishes.set(id, (finishes.get(id) ?? 0) + 1)
         finishedAt.set(id, event.at_ms)
         if (op.outcome?.kind === 'done') finished.add(id)
-        else violations.push('finish of ' + id + ' at ' + where + ' was ' + JSON.stringify(op.outcome))
+        else
+          violations.push('finish of ' + id + ' at ' + where + ' was ' + JSON.stringify(op.outcome))
         leases.delete(id)
       }
     }
@@ -411,7 +416,8 @@ async function run(cell: Cell) {
     })
     child.on('exit', (code, signal) => {
       if (killed.has(name) || (stopping && (code === 0 || signal === 'SIGTERM'))) return
-      exits.push(name + ' exited ' + (code ?? signal) + ': ' + stderr.trim().split('\n').slice(0, 6).join(' | '))
+      const head = stderr.trim().split('\n').slice(0, 6).join(' | ')
+      exits.push(name + ' exited ' + (code ?? signal) + ': ' + head)
     })
     slots[index] = { child, name, ready }
   }
@@ -453,7 +459,8 @@ async function run(cell: Cell) {
       open.set(name, { postedAt: Date.now(), remaining: new Set(tasks.map((task) => task.id)) })
       const verdicts = await board.group(tasks.map(post))
       const refused = verdicts.filter((verdict) => !verdict.ok)
-      if (refused.length > 0) throw new Error('post of ' + name + ' refused: ' + JSON.stringify(refused[0]))
+      if (refused.length > 0)
+        throw new Error('post of ' + name + ' refused: ' + JSON.stringify(refused[0]))
       for (const [id, count] of doneReports) if (count > 0) settle(id)
     }
     await sleep(10)
@@ -504,8 +511,10 @@ async function run(cell: Cell) {
   const errors = { busy: 0, constraint: 0, other: 0 } as Record<string, number>
   const rejected: Record<string, number> = {}
   for (const entry of all) {
-    for (const [kind, count] of Object.entries(entry.metrics.errors)) errors[kind] = (errors[kind] ?? 0) + count
-    for (const [kind, count] of Object.entries(entry.metrics.rejected)) rejected[kind] = (rejected[kind] ?? 0) + count
+    for (const [kind, count] of Object.entries(entry.metrics.errors))
+      errors[kind] = (errors[kind] ?? 0) + count
+    for (const [kind, count] of Object.entries(entry.metrics.rejected))
+      rejected[kind] = (rejected[kind] ?? 0) + count
   }
   const writes = merge(all.map((entry) => entry.metrics.write))
   const reads = merge(all.map((entry) => entry.metrics.read))
@@ -513,10 +522,20 @@ async function run(cell: Cell) {
   const writeCount = total(writes)
   const errorCount = Object.values(errors).reduce((acc, count) => acc + count, 0)
   const seconds = audited.elapsedMs / 1000
-  const lastErrors = [...new Set(all.map((entry) => entry.metrics.lastError).filter(Boolean))].slice(0, 3)
+  const distinct = (values: string[]) => [...new Set(values.filter(Boolean))].slice(0, 3)
+  const lastErrors = distinct(all.map((entry) => entry.metrics.lastError))
+  const refreshMs = sum((entry) => entry.metrics.refreshMs)
+  const refreshes = sum((entry) => entry.metrics.refreshes)
 
   const result = {
-    cell: { concurrency: cell.concurrency, inflight, leaseMs: cell.leaseMs, partitions: cell.partition, pollMs: cell.pollMs, workers: cell.worker },
+    cell: {
+      concurrency: cell.concurrency,
+      inflight,
+      leaseMs: cell.leaseMs,
+      partitions: cell.partition,
+      pollMs: cell.pollMs,
+      workers: cell.worker,
+    },
     claimRejections: rejected,
     claims: audited.claims,
     claimsPerSecond: round(audited.claims / seconds),
@@ -524,11 +543,15 @@ async function run(cell: Cell) {
     donePerSecond: round(audited.tasks / seconds),
     elapsedMs: audited.elapsedMs,
     kills: kills.size,
-    latencyMs: { p50: quantile(audited.latency, 0.5), p95: quantile(audited.latency, 0.95), p99: quantile(audited.latency, 0.99) },
+    latencyMs: {
+      p50: quantile(audited.latency, 0.5),
+      p95: quantile(audited.latency, 0.95),
+      p99: quantile(audited.latency, 0.99),
+    },
     perPartition: audited.perScope,
     pool: {
       errors: sum((entry) => entry.pool.errors),
-      lastErrors: [...new Set(all.map((entry) => entry.pool.lastError).filter(Boolean))].slice(0, 3),
+      lastErrors: distinct(all.map((entry) => entry.pool.lastError)),
       lost: sum((entry) => entry.pool.lost),
       polls: sum((entry) => entry.pool.polls),
       retries: sum((entry) => entry.pool.retries),
@@ -536,10 +559,10 @@ async function run(cell: Cell) {
     reclaimed: audited.reclaimed,
     refresh: {
       count: total(refresh),
-      meanMs: round(sum((entry) => entry.metrics.refreshMs) / Math.max(1, sum((entry) => entry.metrics.refreshes))),
+      meanMs: round(refreshMs / Math.max(1, refreshes)),
       p50Ms: histogramQuantile(refresh, 0.5),
       p99Ms: histogramQuantile(refresh, 0.99),
-      shareOfWorkerTime: round((100 * sum((entry) => entry.metrics.refreshMs)) / (cell.worker * wall)),
+      shareOfWorkerTime: round((100 * refreshMs) / (cell.worker * wall)),
     },
     restartReadyMs: { p50: quantile(restarts, 0.5), max: quantile(restarts, 1) },
     retries: {
@@ -556,7 +579,12 @@ async function run(cell: Cell) {
       writeP99Ms: histogramQuantile(writes, 0.99),
       writes: writeCount,
     },
-    steers: { delivered: sum((entry) => entry.metrics.steered), sent: steered.size, targets: steerTargets.size, verdicts: steerVerdicts },
+    steers: {
+      delivered: sum((entry) => entry.metrics.steered),
+      sent: steered.size,
+      targets: steerTargets.size,
+      verdicts: steerVerdicts,
+    },
     swarmLatencyMs: { p50: quantile(audited.swarms, 0.5), p99: quantile(audited.swarms, 0.99) },
     swarms: postedSwarms,
     takeoverMs: {
@@ -616,10 +644,12 @@ const rows = results.map((result) =>
 )
 console.log(
   [
-    '| partitions | workers | tasks | claims/s | latency p50 / p95 / p99 ms | takeover p50 / max ms (n) | retries per 1k writes | refresh p50 / p99 ms | violations |',
+    '| partitions | workers | tasks | claims/s | latency p50 / p95 / p99 ms | ' +
+      'takeover p50 / max ms (n) | retries per 1k writes | refresh p50 / p99 ms | violations |',
     '|---|---|---|---|---|---|---|---|---|',
     ...rows.map((row) => '| ' + row + ' |'),
   ].join('\n'),
 )
-Fs.writeFileSync(Path.join(output, 'results-' + Date.now() + '.json'), JSON.stringify({ config, machine, results }, null, 2))
+const saved = Path.join(output, 'results-' + Date.now() + '.json')
+Fs.writeFileSync(saved, JSON.stringify({ config, machine, results }, null, 2))
 process.exitCode = results.some((result) => result.violationCount > 0) ? 1 : 0

@@ -77,7 +77,8 @@ const timed: Board.Options['sql'] = {
       const entry = (metrics.operations[operation] ??= { count: 0, ms: 0 })
       entry.count++
       entry.ms += ms
-      record(access === 'read' || /load|scan|read/.test(operation) ? metrics.read : metrics.write, ms)
+      const reads = access === 'read' || /load|scan|read/.test(operation)
+      record(reads ? metrics.read : metrics.write, ms)
     }
   },
 }
@@ -98,7 +99,10 @@ const observed: Board.Board = {
   async claim(id, options) {
     const claimed = await board.claim(id, options)
     if (claimed.ok) emit({ at: Date.now(), e: 'claim', id, tookOver: claimed.tookOver })
-    else metrics.rejected[claimed.rejection.kind] = (metrics.rejected[claimed.rejection.kind] ?? 0) + 1
+    else {
+      const kind = claimed.rejection.kind
+      metrics.rejected[kind] = (metrics.rejected[kind] ?? 0) + 1
+    }
     return claimed
   },
 

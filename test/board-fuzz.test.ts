@@ -6,10 +6,13 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import * as util from 'node:util'
 import { Board, Sql } from 'nanocode-ts/node'
+import { generator, lanes, partitionOf, type Placed, placer } from './board-fuzz.shared.ts'
 
 type Entry = {
   body?: string
+  cap?: Board.Cap | null
   child: number
   claim?: string
   event?: string
@@ -17,14 +20,25 @@ type Entry = {
   id?: string
   key?: string | null
   kind: string
+  labels?: Record<string, string>
+  leaseMs?: number
   message?: string
   needs?: string[]
   ok?: boolean
   outcome?: Board.Outcome
+  parent?: string | null
   phase?: string
   rejection?: string
+  rejectionCap?: unknown
   seq?: number
+  stats?: { errors: number; lastError?: string }
+  t0?: number
+  t1?: number
+  tag?: string
+  tookOver?: boolean
+  untilMs?: number
   upto?: number
+  worker?: string | null
 }
 
 type Run = {
@@ -35,26 +49,29 @@ type Run = {
   proc: childProcess.ChildProcess
 }
 
+type History = {
+  entries: readonly Entry[]
+  tasks: readonly Board.Task[]
+  steers: ReadonlyMap<string, readonly Board.Steer[]>
+  unjournaled: ReadonlySet<string>
+  killedRuns: ReadonlySet<string>
+  partitions: number
+}
+
 // Four processes (board-fuzz.child.ts) write one SQLite board at random for FUZZ_MS (18 s by
 // default; set it higher for a long run), some SIGKILLed and restarted, then a fresh handle checks
 // the invariants against their journals. FUZZ_SEED fixes the random choices (timing still varies);
 // a failure prints it.
 const seed = process.env.FUZZ_SEED ? Number(process.env.FUZZ_SEED) : crypto.randomInt(2 ** 31)
 const runMs = process.env.FUZZ_MS ? Number(process.env.FUZZ_MS) : 18_000
+const partitions = process.env.FUZZ_PARTITIONS
+  ? Number(process.env.FUZZ_PARTITIONS)
+  : seed % 4 === 0
+    ? 1
+    : 4
 const children = 4
 const scope = 'fuzz'
 const script = fileURLToPath(new URL('./board-fuzz.child.ts', import.meta.url))
-
-function generator(seed: number) {
-  let state = seed >>> 0
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0
-    let t = state
-    t = Math.imul(t ^ (t >>> 15), t | 1)
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -70,12 +87,21 @@ function group<T>(items: readonly T[], by: (item: T) => string | undefined) {
   return groups
 }
 
-function start(dir: string, file: string, child: number, generation: number, untilMs: number): Run {
+function start(
+  dir: string,
+  file: string,
+  child: number,
+  generation: number,
+  untilMs: number,
+  pool: boolean,
+): Run {
   const config = {
     child,
     generation,
     journal: path.join(dir, 'journal-' + child + '-' + generation + '.jsonl'),
+    partitions,
     path: file,
+    pool,
     scope,
     seed: (seed * 31 + child) * 31 + generation,
     untilMs,
@@ -110,26 +136,44 @@ function journals(dir: string) {
     )
 }
 
-function check(
-  entries: readonly Entry[],
-  tasks: readonly Board.Task[],
-  steers: ReadonlyMap<string, readonly Board.Steer[]>,
-  killed: ReadonlySet<string>,
-) {
+function finisher(outcome: Board.Outcome | undefined) {
+  const detail = outcome && ('done' in outcome ? outcome.done : outcome.failed)
+  const match = typeof detail === 'string' ? /^c(\d+)g\d+([op])\d+$/.exec(detail) : null
+  return match ? 'agent:c' + match[1] + (match[2] === 'p' ? 'p' : '') : undefined
+}
+
+function check({ entries, tasks, steers, unjournaled, killedRuns, partitions }: History) {
   const violations: string[] = []
   const byId = new Map(tasks.map((task) => [task.id, task]))
   const ok = entries.filter((entry) => entry.ok === true)
   const of = (kind: string) => ok.filter((entry) => entry.kind === kind)
   const finishes = group(of('finish'), (entry) => entry.id)
   const show = (value: unknown) => JSON.stringify(value)
+  const shape = (task: Board.Task): Placed => ({
+    id: task.id,
+    labels: task.labels,
+    parent: task.parent ?? null,
+  })
+  const place = placer(partitions, (id) => {
+    const task = byId.get(id)
+    return task && shape(task)
+  })
+  const where = (entry: Entry) => {
+    const task = byId.get(entry.id!)
+    return task
+      ? place(shape(task))
+      : place({ id: entry.id!, labels: entry.labels ?? {}, parent: entry.parent ?? null })
+  }
+  const journaled = (entry: Entry) => !killedRuns.has(entry.child + '/' + entry.generation)
 
   for (const entry of entries) {
     if (entry.kind === 'error') violations.push('child ' + entry.child + ' threw: ' + entry.message)
     if (entry.rejection === 'Unknown') violations.push('Unknown rejection: ' + show(entry))
+    if (entry.kind === 'pool-stats' && entry.stats!.errors > 0)
+      violations.push('pool of child ' + entry.child + ' hit errors: ' + show(entry.stats))
   }
 
-  // One call lands one event, so only the repeats of one keyed write share a seq.
-  for (const [seq, same] of group(ok, (entry) => String(entry.seq)))
+  for (const [seq, same] of group(ok, (entry) => where(entry) + '/' + entry.seq))
     if (
       new Set(same.map((entry) => entry.event)).size > 1 ||
       (same.length > 1 && new Set(same.map((entry) => entry.kind + ' ' + entry.key)).size > 1) ||
@@ -140,6 +184,26 @@ function check(
   for (const posted of of('post'))
     if (!posted.key && !byId.has(posted.id!))
       violations.push('post ' + posted.id + ' was acknowledged but made no task: ' + show(posted))
+
+  for (const posted of entries.filter((entry) => entry.kind === 'post' && !entry.key)) {
+    const home = where(posted)
+    const away = (posted.needs ?? []).filter((need) => {
+      const task = byId.get(need)
+      return !task || place(shape(task)) !== home
+    })
+    if (posted.ok && away.length > 0)
+      violations.push(
+        'post ' +
+          posted.id +
+          ' in partition ' +
+          home +
+          ' took needs ' +
+          show(away) +
+          ' from others',
+      )
+    if (!posted.ok && posted.rejection === 'UnknownNeed' && away.length === 0)
+      violations.push('post ' + posted.id + ' was refused UnknownNeed with every need beside it')
+  }
 
   for (const [id, done] of finishes) {
     const task = byId.get(id)
@@ -154,7 +218,11 @@ function check(
     (entry) => entry.kind === 'seen' || entry.kind === 'watched',
   )) {
     const task = byId.get(entry.id!)
-    if (task?.phase !== entry.phase || show(task.outcome) !== show(entry.outcome))
+    if (
+      task?.phase !== entry.phase ||
+      show(task.outcome) !== show(entry.outcome) ||
+      (entry.worker !== undefined && task.worker !== entry.worker)
+    )
       violations.push(entry.id + ' was seen ' + show(entry) + ' but is now ' + show(task))
   }
 
@@ -171,6 +239,17 @@ function check(
       (steers.get(task.id) ?? []).length > 0
     )
       violations.push(task.id + ' finished with unheeded steers: ' + show(steers.get(task.id)))
+    if (task.phase === 'done' || task.phase === 'failed') {
+      const expected = finisher(task.outcome)
+      if (expected ? task.worker !== expected : !task.worker?.startsWith('agent:c'))
+        violations.push(
+          task.id +
+            ' was finished by ' +
+            (expected ?? 'a pool') +
+            ' but names ' +
+            show(task.worker),
+        )
+    }
   }
 
   for (const claim of of('claim')) {
@@ -189,6 +268,104 @@ function check(
     }
   }
 
+  const leaseKey = (entry: Entry) => entry.id + ' ' + entry.claim
+  const cancelled = (id: string) => byId.get(id)?.phase === 'cancelled'
+  const renews = group(of('renew'), leaseKey)
+  const ends = group(
+    ok.filter((entry) => entry.kind === 'finish' || entry.kind === 'release'),
+    leaseKey,
+  )
+  type Lease = { claim: Entry; ended: number; renews: Entry[] }
+  const bySeq = (a: Entry, b: Entry) => a.seq! - b.seq!
+  const certainUntil = (lease: Lease, seq: number) => {
+    const renew = lease.renews.findLast((renew) => renew.seq! < seq)
+    return renew ? renew.t0! + renew.leaseMs! : lease.claim.untilMs!
+  }
+  for (const [partition, claims] of group(of('claim'), (entry) => String(where(entry)))) {
+    let active: Lease[] = []
+    for (const claim of claims.toSorted((a, b) => a.seq! - b.seq!)) {
+      const atMs = claim.untilMs! - claim.leaseMs!
+      active = active.filter(
+        (lease) => lease.ended > claim.seq! && certainUntil(lease, Infinity) > atMs - 60_000,
+      )
+      const holding = active.filter((lease) => certainUntil(lease, claim.seq!) > atMs)
+      const same = holding.filter((lease) => lease.claim.id === claim.id)
+      if (same.length > 0)
+        violations.push(
+          claim.id +
+            ' was claimed at ' +
+            claim.seq +
+            ' while held: ' +
+            show(same.map((lease) => lease.claim)),
+        )
+      const cap = claim.cap
+      if (cap !== undefined && cap !== null) {
+        const max = typeof cap === 'number' ? cap : cap.max
+        const counted = holding.filter(
+          (lease) =>
+            lease.claim.id !== claim.id &&
+            (typeof cap === 'number' ||
+              byId.get(lease.claim.id!)?.labels[cap.label[0]] === cap.label[1]),
+        )
+        if (counted.length >= max)
+          violations.push(
+            claim.id +
+              ' was claimed at ' +
+              partition +
+              '/' +
+              claim.seq +
+              ' under cap ' +
+              show(cap) +
+              ' with ' +
+              counted.length +
+              ' held: ' +
+              show(counted.map((lease) => lease.claim.id)),
+          )
+      }
+      if (journaled(claim) && !cancelled(claim.id!))
+        active.push({
+          claim,
+          ended: Math.min(...(ends.get(leaseKey(claim)) ?? []).map((entry) => entry.seq!)),
+          renews: (renews.get(leaseKey(claim)) ?? []).toSorted(bySeq),
+        })
+    }
+  }
+  for (const refused of entries.filter(
+    (entry) => entry.kind === 'claim' && entry.rejection === 'Full',
+  ))
+    if (!util.isDeepStrictEqual(refused.rejectionCap, refused.cap))
+      violations.push('claim refused Full names another cap: ' + show(refused))
+
+  for (const run of group(entries, (entry) => entry.child + '/' + entry.generation).values()) {
+    const until = new Map<string, number>()
+    for (const entry of run) {
+      if (entry.kind === 'claim' && entry.ok && !cancelled(entry.id!))
+        until.set(leaseKey(entry), entry.untilMs!)
+      const untilMs = entry.claim === undefined ? undefined : until.get(leaseKey(entry))
+      if (untilMs === undefined || entry.kind === 'claim') continue
+      if (entry.ok && (entry.kind === 'finish' || entry.kind === 'release'))
+        until.delete(leaseKey(entry))
+      else if (entry.ok && entry.kind === 'renew')
+        until.set(leaseKey(entry), entry.t0! + entry.leaseMs!)
+      else if (
+        !entry.ok &&
+        (entry.rejection === 'NotHolder' || entry.rejection === 'Terminal') &&
+        entry.t1! < untilMs
+      )
+        violations.push(
+          entry.id +
+            ' ' +
+            entry.kind +
+            ' was refused ' +
+            entry.rejection +
+            ' at ' +
+            entry.t1 +
+            ' though its lease ran to ' +
+            untilMs,
+        )
+    }
+  }
+
   for (const [key, posts] of group(of('post'), (entry) => entry.key ?? undefined)) {
     if (new Set(posts.map((entry) => entry.seq)).size > 1)
       violations.push('keyed post ' + key + ' landed at several seqs: ' + show(posts))
@@ -197,7 +374,7 @@ function check(
     if (made.length > 1)
       violations.push('keyed post ' + key + ' made ' + show(made.map((task) => task.id)))
 
-  for (const [body, sent] of group(of('steer'), (entry) => entry.body))
+  for (const [body, sent] of group(of('steer'), (entry) => where(entry) + '/' + entry.body))
     if (new Set(sent.map((entry) => entry.seq)).size > 1)
       violations.push('steer ' + body + ' landed at several seqs: ' + show(sent))
 
@@ -234,7 +411,7 @@ function check(
   }
   for (const sent of of('steer')) {
     const task = byId.get(sent.id!)
-    if (sent.key || killed.has(sent.id!) || sent.seq! <= (heeded.get(sent.id!) ?? 0)) continue
+    if (sent.key || unjournaled.has(sent.id!) || sent.seq! <= (heeded.get(sent.id!) ?? 0)) continue
     if (task?.phase !== 'open' && task?.phase !== 'claimed') continue
     if (
       !(steers.get(sent.id!) ?? []).some(
@@ -254,8 +431,10 @@ test('the fuzz checker flags broken histories', () => {
       id,
       labels: {},
       needs: [],
+      parent: null,
       phase: 'done',
       outcome: { done: 'x' },
+      worker: 'agent:c0',
       ...fields,
     }) as Board.Task
   const entry = (fields: Partial<Entry>): Entry => ({
@@ -265,23 +444,24 @@ test('the fuzz checker flags broken histories', () => {
     kind: 'post',
     ...fields,
   })
+  const open = { attempts: 0, phase: 'open', outcome: undefined, worker: undefined } as const
   const tasks = [
     task('a', { outcome: { done: 'second' } }),
     task('b', { needs: ['c'], phase: 'claimed', outcome: undefined }),
-    task('c', { attempts: 0, phase: 'open', outcome: undefined }),
-    task('k1', {
-      labels: { key: 'agent:c0#post-1' },
-      phase: 'open',
-      attempts: 0,
-      outcome: undefined,
-    }),
-    task('k2', {
-      labels: { key: 'agent:c0#post-1' },
-      phase: 'open',
-      attempts: 0,
-      outcome: undefined,
-    }),
+    task('c', open),
+    task('k1', { ...open, labels: { key: 'agent:c0#post-1' } }),
+    task('k2', { ...open, labels: { key: 'agent:c0#post-1' } }),
+    task('w', { outcome: { done: 'c1g0o4' }, worker: 'agent:c2' }),
+    task('p0', { ...open, labels: { project: 'proj-0' } }),
+    task('p1', { ...open, labels: { project: 'proj-1' } }),
+    task('x', { ...open, labels: { project: 'proj-1' }, needs: ['p0'] }),
+    task('l1', { ...open, labels: { lane: 'capA', project: 'proj-2' } }),
+    task('l2', { ...open, labels: { lane: 'capA', project: 'proj-2' } }),
+    task('l3', open),
+    task('gone2', { ...open, phase: 'cancelled' }),
   ]
+  const lease = (id: string, claim: string, seq: number, cap?: Board.Cap) =>
+    entry({ kind: 'claim', id, claim, seq, cap: cap ?? null, leaseMs: 100, untilMs: 1_100 + seq })
   const entries = [
     entry({ kind: 'finish', id: 'a', seq: 5, outcome: { done: 'first' } }),
     entry({ kind: 'finish', id: 'a', seq: 6, outcome: { done: 'second' } }),
@@ -289,34 +469,103 @@ test('the fuzz checker flags broken histories', () => {
     entry({ kind: 'steer', id: 'c', body: 's1', seq: 8 }),
     entry({ kind: 'heed', id: 'c', upto: 8, seq: 9 }),
     entry({ kind: 'heed', id: 'c', upto: 7, seq: 10 }),
-    entry({ kind: 'renew', id: 'b', seq: 10 }),
+    entry({ kind: 'renew', id: 'b', seq: 13 }),
     entry({ kind: 'post', id: 'gone', seq: 11 }),
+    entry({ kind: 'post', id: 'x', seq: 12, labels: { project: 'proj-1' }, needs: ['p0'] }),
+    lease('l1', 'agent:c0.20', 20, { max: 1, label: ['lane', 'capA'] }),
+    lease('l2', 'agent:c0.21', 21, { max: lanes.capA, label: ['lane', 'capA'] }),
+    lease('l1', 'agent:c0.22', 22),
+    lease('l3', 'agent:c0.30', 30),
+    entry({ kind: 'renew', id: 'l3', claim: 'agent:c0.30', seq: 31, t0: 1_000, leaseMs: 10 }),
+    lease('l3', 'agent:c0.32', 32),
+    lease('gone2', 'agent:c0.40', 40),
+    entry({
+      kind: 'finish',
+      id: 'gone2',
+      claim: 'agent:c0.40',
+      ok: false,
+      rejection: 'Terminal',
+      t1: 1_041,
+    }),
+    entry({
+      kind: 'claim',
+      id: 'l2',
+      ok: false,
+      cap: { max: 1, label: ['lane', 'capA'] },
+      rejection: 'Full',
+      rejectionCap: { label: ['lane', 'capA'], max: 1 },
+    }),
+    entry({
+      kind: 'release',
+      id: 'l1',
+      claim: 'agent:c0.20',
+      ok: false,
+      rejection: 'NotHolder',
+      t1: 1_050,
+    }),
+    entry({ kind: 'release', id: 'l1', claim: 'agent:c0.20', seq: 23 }),
   ]
-  const violations = check(entries, tasks, new Map(), new Set())
+  const violations = check({
+    entries,
+    tasks,
+    steers: new Map(),
+    unjournaled: new Set(),
+    killedRuns: new Set(),
+    partitions: 4,
+  })
   for (const expected of [
     'a finished more than once',
     'b was claimed with needs ["c"] not done',
     'keyed post agent:c0#post-1 made ["k1","k2"]',
-    'steer s1 landed at several seqs',
+    'steer ' + partitionOf('c', 4) + '/s1 landed at several seqs',
     'c heed ran backwards',
-    'seq 10 went to several writes',
     'post gone was acknowledged but made no task',
+    'w was finished by agent:c1 but names "agent:c2"',
+    'post x in partition 0 took needs ["p0"] from others',
+    'l2 was claimed at ',
+    'l1 was claimed at 22 while held',
+    'l1 release was refused NotHolder',
   ])
     assert.ok(
       violations.some((violation) => violation.startsWith(expected)),
       expected + ' in ' + JSON.stringify(violations),
     )
+  for (const unexpected of ['seq ', 'l3 was claimed at 32', 'claim refused Full', 'gone2 '])
+    assert.ok(
+      !violations.some((violation) => violation.startsWith(unexpected)),
+      unexpected + ' in ' + JSON.stringify(violations),
+    )
+  const single = check({
+    entries: [
+      entry({ kind: 'renew', id: 'p0', seq: 3 }),
+      entry({ kind: 'renew', id: 'p1', seq: 3 }),
+    ],
+    tasks,
+    steers: new Map(),
+    unjournaled: new Set(),
+    killedRuns: new Set(),
+    partitions: 1,
+  })
+  assert.ok(
+    single.some((violation) => violation.startsWith('seq 0/3 went to several writes')),
+    JSON.stringify(single),
+  )
 })
 
 test(
-  'Board fuzz: ' + children + ' processes on one SQLite file, FUZZ_SEED=' + seed,
+  'Board fuzz: ' +
+    children +
+    ' processes on one SQLite file, ' +
+    partitions +
+    ' partitions, FUZZ_SEED=' +
+    seed,
   { timeout: runMs + 120_000 },
   async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-fuzz-'))
     const file = path.join(dir, 'board.sqlite')
     const random = generator(seed)
     const sql = Sql.open(file)
-    const live = await Board.open({ sql, scope, actor: 'agent:checker' })
+    const live = await Board.open({ sql, scope, actor: 'agent:checker', partitions })
     let passed = false
     try {
       const granted = await live.grant(
@@ -328,7 +577,7 @@ test(
       const untilMs = Date.now() + runMs
       const runs: Run[] = []
       const current = Array.from({ length: children }, (_, child) =>
-        start(dir, file, child, 0, untilMs),
+        start(dir, file, child, 0, untilMs, random() < 0.75),
       )
       runs.push(...current)
       const watched: Entry[] = []
@@ -344,6 +593,7 @@ test(
               kind: 'watched',
               outcome: task.outcome!,
               phase: task.phase,
+              worker: task.worker ?? null,
             })
         if (random() < 0.1) {
           const child = Math.floor(random() * children)
@@ -352,7 +602,7 @@ test(
           victim.proc.kill('SIGKILL')
           await victim.exit
           await sleep(Math.floor(random() * 200))
-          current[child] = start(dir, file, child, victim.generation + 1, untilMs)
+          current[child] = start(dir, file, child, victim.generation + 1, untilMs, random() < 0.75)
           runs.push(current[child])
         }
       }
@@ -378,7 +628,12 @@ test(
       await live.refresh()
       const liveTasks = (await live.tasks(atMs)).toSorted((a, b) => a.id.localeCompare(b.id))
       const replaySql = Sql.open(file)
-      const replay = await Board.open({ sql: replaySql, scope, actor: 'agent:checker' })
+      const replay = await Board.open({
+        sql: replaySql,
+        scope,
+        actor: 'agent:checker',
+        partitions,
+      })
       try {
         const tasks = (await replay.tasks(atMs)).toSorted((a, b) => a.id.localeCompare(b.id))
         assert.deepEqual(
@@ -394,20 +649,21 @@ test(
         }
 
         const entries = [...journals(dir), ...watched]
-        const killed = new Set(
+        const killedRuns = new Set(
+          runs.filter((run) => run.killed).map((run) => run.child + '/' + run.generation),
+        )
+        const unjournaled = new Set(
           entries
             .filter(
               (entry) =>
-                entry.kind === 'claim' &&
-                entry.ok &&
-                runs.some(
-                  (run) =>
-                    run.killed && run.child === entry.child && run.generation === entry.generation,
-                ),
+                entry.kind === 'pool-run' ||
+                (entry.kind === 'claim' &&
+                  entry.ok &&
+                  killedRuns.has(entry.child + '/' + entry.generation)),
             )
             .map((entry) => entry.id!),
         )
-        const violations = check(entries, tasks, steers, killed)
+        const violations = check({ entries, tasks, steers, unjournaled, killedRuns, partitions })
         for (const task of tasks.filter((task) => task.phase === 'claimed')) {
           if (task.stage === 'held' || task.untilMs! > atMs)
             violations.push(
@@ -426,6 +682,8 @@ test(
           'seed ' +
             seed +
             ': ' +
+            partitions +
+            ' partitions, ' +
             tasks.length +
             ' tasks, ' +
             runs.length +
@@ -436,6 +694,8 @@ test(
             ' claims, ' +
             count('finish') +
             ' finishes, ' +
+            entries.filter((entry) => entry.kind === 'pool-run').length +
+            ' pool runs, ' +
             count('steer') +
             ' steers, ' +
             count('heed') +
@@ -447,7 +707,11 @@ test(
         )
         const rejected = new Map<string, number>()
         for (const entry of entries.filter((entry) => entry.ok === false)) {
-          const name = entry.kind + ':' + (entry.rejection ?? 'error')
+          const name =
+            entry.kind +
+            ':' +
+            (entry.rejection ?? 'error') +
+            (entry.rejection === 'Full' ? (typeof entry.cap === 'number' ? '#' : '@label') : '')
           rejected.set(name, (rejected.get(name) ?? 0) + 1)
         }
         t.diagnostic('rejections ' + JSON.stringify(Object.fromEntries([...rejected].toSorted())))
@@ -464,6 +728,8 @@ test(
           seed +
           ' FUZZ_MS=' +
           runMs +
+          ' FUZZ_PARTITIONS=' +
+          partitions +
           ' failed; journals and board kept in ' +
           dir +
           '\n' +

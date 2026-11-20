@@ -247,6 +247,57 @@ if (process.env.NC_WAKE_CHILD) {
         await near.close()
         await far.close()
       })
+
+      test("a pool woken by another's finish still wakes that pool with its own writes", async () => {
+        const schema = 'nc_board_wake_carry_' + process.pid
+        schemas.push(schema)
+        const sql = Sql.open(url, { schema })
+        const open = (actor: string) =>
+          Board.open({ sql, scope: 'carry', actor, charter: actor === 'agent:parent' })
+        const parent = await open('agent:parent')
+        const granted = await parent.grant(
+          { who: [{ kind: 'kind', id: 'agent' }], can: { '*': ['manage'] } },
+          { key: 'grant-agents' },
+        )
+        assert.ok(granted.ok, JSON.stringify(granted))
+        const [left, right] = await Promise.all([open('agent:left'), open('agent:right')])
+        const done = new Map<string, number>()
+        const pool = (board: Board.Board, who: string) =>
+          Board.pool(board, {
+            label: ['who', who],
+            concurrency: 1,
+            leaseMs: 30_000,
+            pollMs,
+            wake: Sql.wake(sql),
+            async run(task) {
+              // right's run posts work for left from the tick left's finish woke.
+              if (task.id === 'second') {
+                const back = { id: 'third', spec: 'back', labels: { who: 'left' } }
+                const posted = await board.post(back)
+                assert.ok(posted.ok, JSON.stringify(posted))
+              }
+              done.set(task.id, Date.now())
+              return { done: who }
+            },
+          })
+        const pools = [pool(left, 'left'), pool(right, 'right')]
+        // Each pool's first poll finds nothing, so only wakes can bring the work below in time.
+        while (pools.some((each) => each.stats().polls === 0)) await sleep(5)
+        await sleep(50)
+        const started = Date.now()
+        assert.ok((await parent.post({ id: 'first', spec: 'go', labels: { who: 'left' } })).ok)
+        const second = { id: 'second', spec: 'then', labels: { who: 'right' }, needs: ['first'] }
+        assert.ok((await parent.post(second)).ok)
+        while (!done.has('third')) {
+          const waited = 'third waited for a poll: ' + JSON.stringify([...done])
+          assert.ok(Date.now() - started < pollMs / 2, waited)
+          await sleep(5)
+        }
+        process.stdout.write('# carried wake ' + (done.get('third')! - started) + ' ms\n')
+        await Promise.all(pools.map((each) => each.stop()))
+        await Promise.all([parent, left, right].map((board) => board.close()))
+        await sql.close()
+      })
     })
   }
 }

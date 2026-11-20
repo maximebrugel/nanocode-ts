@@ -393,6 +393,12 @@ export type SqlKind = 'store' | 'log'
 
 export type SqlAccess = 'read' | 'write' | 'schema'
 
+/**
+ * Which Board.pool wakes a write reaches: none, or every pool but from (the writing pool's own
+ * wake). Boards pass it to transaction for calls a pool makes through its wake's own.
+ */
+export type SqlReach = { readonly reach: 'none' | 'others'; readonly from?: unknown }
+
 export type SqlHost = {
   readonly value_limit?: number
   transaction(
@@ -400,6 +406,7 @@ export type SqlHost = {
     operation: string,
     statements: Statement[],
     access?: SqlAccess,
+    reach?: SqlReach,
   ): SqlValue[][][] | Promise<SqlValue[][][]>
 }
 

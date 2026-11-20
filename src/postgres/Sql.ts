@@ -1,6 +1,6 @@
-import * as AsyncHooks from 'node:async_hooks'
 import postgres from 'postgres'
 import type * as Contracts from '../Contracts.ts'
+import * as SqlReach from '../SqlReach.ts'
 
 /** A Postgres database as a Contracts.SqlHost, shareable by processes on any number of machines. */
 export type Host = Omit<Contracts.SqlHost, 'transaction'> & {
@@ -11,6 +11,7 @@ export type Host = Omit<Contracts.SqlHost, 'transaction'> & {
     operation: string,
     statements: Contracts.Statement[],
     access?: Contracts.SqlAccess,
+    reach?: Contracts.SqlReach,
   ): Promise<Contracts.SqlValue[][][]>
   close(): Promise<void>
 }
@@ -128,8 +129,6 @@ type Link = { id: string; local: Set<() => void>; sql: postgres.Sql }
 
 const links = new WeakMap<Host, Link>()
 
-const reaching = new AsyncHooks.AsyncLocalStorage<{ reach: Reach; from: () => void }>()
-
 /**
  * Opens a pool of connections to the Postgres database at url. Writes run in READ COMMITTED
  * transactions, as nanocode's Postgres store does: the log's primary key fences appends, so a lost
@@ -195,7 +194,7 @@ export function open(url: string, options: Options = {}): Host {
   const host: Host = {
     schema,
     ...(valueLimit === undefined ? {} : { value_limit: valueLimit }),
-    async transaction(_kind, _operation, statements, access = 'write') {
+    async transaction(_kind, _operation, statements, access = 'write', reach) {
       if (closed) throw new Error('the Postgres host for ' + redact(url) + ' is closed')
       if (ready !== undefined) await ready
       ready = undefined
@@ -213,10 +212,9 @@ export function open(url: string, options: Options = {}): Host {
       })
       if (access !== 'read' && statements.some(([query]) => logWrite.test(query))) {
         // Other hosts hear the notification; this host's own pools are woken here directly.
-        const own = reaching.getStore()
-        if (own?.reach !== 'none') {
+        if (reach?.reach !== 'none') {
           notify()
-          for (const fire of local) if (fire !== own?.from) fire()
+          for (const fire of local) if (fire !== reach?.from) fire()
         }
       }
       return results as unknown as Contracts.SqlValue[][][]
@@ -237,7 +235,10 @@ export type WakeOptions = {
   debounceMs?: number
 }
 
-/** Stops a subscription; own runs the subscriber's own write so that it wakes only reach. */
+/**
+ * Stops a subscription; own runs the subscriber's own write so that it wakes only reach. The
+ * write must make its board call before its first await (SqlReach.reaching).
+ */
 export type Subscription = (() => void) & {
   own<T>(reach: Reach, write: () => Promise<T>): Promise<T>
 }
@@ -278,7 +279,8 @@ export function wake(host: Host, options: WakeOptions = {}): (notify: () => void
       void listening.then((listened) => listened?.unlisten().catch(() => {}))
     }
     return Object.assign(stop, {
-      own: <T>(reach: Reach, write: () => Promise<T>) => reaching.run({ reach, from: fire }, write),
+      own: <T>(reach: Reach, write: () => Promise<T>) =>
+        SqlReach.reaching({ reach, from: fire }, write),
     })
   }
 }

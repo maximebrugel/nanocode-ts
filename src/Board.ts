@@ -1,5 +1,6 @@
 import * as AgentRuntime from './AgentRuntime.ts'
 import type * as Contracts from './Contracts.ts'
+import * as SqlReach from './SqlReach.ts'
 
 export type Retry = { maxAttempts: number; backoffMs: number }
 
@@ -203,7 +204,16 @@ export type Board = {
 
 export async function open(options: Options): Promise<Board> {
   const module = options.module ?? (await bundled())
-  const runtime = await AgentRuntime.instantiate(module, options.sql, { published() {} })
+  // The board runs one request at a time, so the reach its current request carries is its own.
+  const reach: { current?: Contracts.SqlReach | undefined } = {}
+  const sql: Contracts.SqlHost = {
+    get value_limit() {
+      return options.sql.value_limit
+    },
+    transaction: (kind, operation, statements, access) =>
+      options.sql.transaction(kind, operation, statements, access, reach.current),
+  }
+  const runtime = await AgentRuntime.instantiate(module, sql, { published() {} })
   try {
     const board = (await runtime.board({
       open: {
@@ -215,7 +225,7 @@ export async function open(options: Options): Promise<Board> {
           : { checkpoint_every: options.checkpointEvery }),
       },
     })) as number
-    const opened = wrap(runtime, board, options)
+    const opened = wrap(runtime, board, options, reach)
     if ((options.charter ?? true) && !options.actor.includes('+')) {
       const chartered = await opened.charter()
       if (!chartered.ok && chartered.rejection.kind !== 'Exists') {
@@ -295,11 +305,24 @@ export async function memorySql(): Promise<MemorySql> {
   }
 }
 
-function wrap(runtime: AgentRuntime.AgentRuntime, board: number, options: Options): Board {
+function wrap(
+  runtime: AgentRuntime.AgentRuntime,
+  board: number,
+  options: Options,
+  reach: { current?: Contracts.SqlReach | undefined },
+): Board {
   const now = (atMs?: number) => atMs ?? Date.now()
   let queue: Promise<unknown> = Promise.resolve()
   const call = (request: object) => {
-    const next = queue.then(() => runtime.board(request))
+    const carried = SqlReach.current()
+    const next = queue.then(async () => {
+      reach.current = carried
+      try {
+        return await runtime.board(request)
+      } finally {
+        reach.current = undefined
+      }
+    })
     queue = next.catch(() => undefined)
     return next
   }

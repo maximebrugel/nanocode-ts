@@ -27,7 +27,8 @@ export type PoolOptions = {
 /**
  * Stops a wake subscription. own, when given, runs one of the pool's own writes so that it wakes
  * no pool (a claim, renewal or heed, which never makes work ready) or every pool but this one (a
- * finish or release: this pool polls when a run ends anyway).
+ * finish or release: this pool polls when a run ends anyway). Each write makes its board call
+ * before its first await, which is how the board tells the host its reach.
  */
 export type PoolWake = (() => void) & {
   own?<T>(reach: 'none' | 'others', write: () => Promise<T>): Promise<T>

@@ -46,7 +46,7 @@ export type Rejection = {
   kind: RejectionKind
   claim?: string
   untilMs?: number
-  cap?: number
+  cap?: Cap
   from?: string
   to?: string
   fence?: { partition: number; epoch: number }
@@ -60,6 +60,10 @@ export type Verdict =
 export type Claimed =
   | { ok: true; claim: string; untilMs: number; tookOver: boolean; seq: number }
   | { ok: false; rejection: Rejection }
+
+// A claim cap: at most max live leases on the task's partition, or only those whose task
+// carries the label, so each label value is capped on its own.
+export type Cap = number | { max: number; label: [string, string] }
 
 export type Phase = 'open' | 'claimed' | 'done' | 'failed' | 'cancelled' | 'blocked'
 
@@ -85,6 +89,7 @@ export type Task = {
   phase: Phase
   stage: Stage
   claim?: string
+  // The lease holder while claimed; on done or failed, the worker that finished it.
   worker?: string
   untilMs?: number
   attempts: number
@@ -143,7 +148,7 @@ export type Board = {
   readonly scope: string
   readonly actor: string
   post(task: NewTask, options?: { key?: string; atMs?: number }): Promise<Verdict>
-  claim(id: string, options: { leaseMs: number; cap?: number; atMs?: number }): Promise<Claimed>
+  claim(id: string, options: { leaseMs: number; cap?: Cap; atMs?: number }): Promise<Claimed>
   renew(id: string, claim: string, leaseMs: number, atMs?: number): Promise<Verdict>
   release(id: string, claim: string, note?: string, atMs?: number): Promise<Verdict>
   finish(id: string, claim: string, outcome: Outcome, atMs?: number): Promise<Verdict>
@@ -168,7 +173,7 @@ export type Board = {
   group(writes: Write[]): Promise<Verdict[]>
   work(
     id: string,
-    options: { leaseMs: number; cap?: number },
+    options: { leaseMs: number; cap?: Cap },
     step: (lease: Lease, steers: Steer[]) => Promise<Outcome>,
   ): Promise<Outcome>
   close(): Promise<void>
@@ -283,7 +288,12 @@ function wrap(runtime: AgentRuntime.AgentRuntime, board: number, options: Option
 
     async claim(id, { leaseMs, cap, atMs }) {
       const verdict = await write(
-        { op: 'claim', task: id, lease_ms: leaseMs, ...(cap === undefined ? {} : { cap }) },
+        {
+          op: 'claim',
+          task: id,
+          lease_ms: leaseMs,
+          ...(cap === undefined ? {} : { cap: wireCap(cap) }),
+        },
         { atMs },
       )
       if (!verdict.ok) return verdict
@@ -466,4 +476,10 @@ function newTask(task: NewTask) {
         : { retry: { max_attempts: terms.retry.maxAttempts, backoff_ms: terms.retry.backoffMs } }),
     },
   }
+}
+
+function wireCap(cap: Cap) {
+  if (typeof cap === 'number') return cap
+  const [key, value] = cap.label
+  return { max: cap.max, key, value }
 }

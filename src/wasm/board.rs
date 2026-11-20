@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::BTreeMap, num::NonZeroU32, sync::Arc};
 
 use nanocode::turnlog::{LogHost, SqlLog};
 use nanocode_board::{
-    Applied, Board, BoardError, ClaimId, Op, Phase, Rejection, Task, TaskId,
+    Applied, Board, BoardError, Cap, ClaimId, Op, Phase, Rejection, Task, TaskId,
     access::{Identity, Verifier},
     shards::{self, Merged, Route},
     steer::Steer,
@@ -350,6 +350,12 @@ fn verdict(board: &Board, applied: Result<Applied, BoardError>) -> Result<Value,
 }
 
 fn rejected(rejection: &Rejection) -> Value {
+    if let Rejection::Full {
+        cap: Cap::Label { max, key, value },
+    } = rejection
+    {
+        return json!({ "cap": { "label": [key, value], "max": max }, "kind": "Full" });
+    }
     match serde_json::to_value(rejection) {
         Ok(Value::String(kind)) => json!({ "kind": kind }),
         Ok(Value::Object(tagged)) => {
@@ -428,12 +434,24 @@ fn view(merged: &Merged<'_>, task: &Task, at_ms: u64) -> Value {
             until_ms,
             worker,
         } => json!({ "claim": claim, "phase": "claimed", "untilMs": until_ms, "worker": worker }),
-        Phase::Done { result } => json!({ "outcome": { "done": result }, "phase": "done" }),
-        Phase::Failed { error } => json!({ "outcome": { "failed": error }, "phase": "failed" }),
+        Phase::Done { result, worker } => {
+            finished(json!({ "outcome": { "done": result }, "phase": "done" }), worker.as_deref())
+        }
+        Phase::Failed { error, worker } => finished(
+            json!({ "outcome": { "failed": error }, "phase": "failed" }),
+            worker.as_deref(),
+        ),
         Phase::Open => json!({ "phase": "open" }),
     };
     if let (Value::Object(out), Value::Object(phase)) = (&mut out, phase) {
         out.extend(phase);
     }
     out
+}
+
+fn finished(mut phase: Value, worker: Option<&str>) -> Value {
+    if let (Value::Object(phase), Some(worker)) = (&mut phase, worker) {
+        phase.insert("worker".into(), worker.into());
+    }
+    phase
 }

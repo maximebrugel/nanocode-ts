@@ -262,6 +262,69 @@ if (process.env.NC_BOARD_CHILD) {
       await close()
     })
 
+    test('a label cap counts only leases on tasks with that label', async () => {
+      const { board, close } = await open(file(), 'alice')
+      const t = Date.now()
+      for (const id of ['a1', 'a2', 'b1', 'b2']) {
+        ok(await board.post({ id, spec: id, labels: { lane: id[0] } }, { atMs: t }))
+      }
+      ok(await board.post({ id: 'u', spec: 'unlabelled' }, { atMs: t }))
+      const a: Board.Cap = { max: 1, label: ['lane', 'a'] }
+      const b: Board.Cap = { max: 1, label: ['lane', 'b'] }
+      const a1 = ok(await board.claim('a1', { leaseMs: 1_000, cap: a, atMs: t }))
+      assert.deepEqual(
+        rejected(await board.claim('a2', { leaseMs: 1_000, cap: a, atMs: t + 1 }), 'Full').cap,
+        a,
+      )
+      // lane=b has its own budget on the same partition.
+      ok(await board.claim('b1', { leaseMs: 1_000, cap: b, atMs: t + 1 }))
+      rejected(await board.claim('b2', { leaseMs: 1_000, cap: b, atMs: t + 2 }), 'Full')
+      ok(
+        await board.claim('u', {
+          leaseMs: 1_000,
+          cap: { max: 1, label: ['lane', 'u'] },
+          atMs: t + 2,
+        }),
+      )
+      // A partition cap still counts every live lease.
+      assert.equal(
+        rejected(await board.claim('a2', { leaseMs: 1_000, cap: 3, atMs: t + 3 }), 'Full').cap,
+        3,
+      )
+      assert.deepEqual(ids(await board.held(t + 3)), ['a1', 'b1', 'u'])
+
+      ok(await board.finish('a1', a1.claim, { done: 'a1' }, t + 4))
+      ok(await board.claim('a2', { leaseMs: 1_000, cap: a, atMs: t + 5 }))
+      rejected(await board.claim('b2', { leaseMs: 1_000, cap: b, atMs: t + 5 }), 'Full')
+      await close()
+    })
+
+    test('a finished task keeps the worker that finished it', async () => {
+      const path = file()
+      const alice = await open(path, 'alice')
+      const bob = await open(path, 'bob')
+      const t = Date.now()
+      for (const id of ['d', 'f', 'c']) ok(await alice.board.post({ id, spec: id }, { atMs: t }))
+      const d = ok(await bob.board.claim('d', { leaseMs: 60_000, atMs: t + 1 }))
+      ok(await bob.board.finish('d', d.claim, { done: 'ok' }, t + 2))
+      const f = ok(await alice.board.claim('f', { leaseMs: 60_000, atMs: t + 3 }))
+      ok(await alice.board.finish('f', f.claim, { failed: 'no' }, t + 4))
+      ok(await alice.board.cancel('c', 'unneeded', t + 5))
+
+      await alice.board.refresh()
+      await bob.board.refresh()
+      const done = await task(alice.board, 'd', t + 6)
+      assert.equal(done.phase, 'done')
+      assert.equal(done.worker, 'agent:bob')
+      assert.equal(done.claim, undefined)
+      const failed = await task(bob.board, 'f', t + 6)
+      assert.equal(failed.phase, 'failed')
+      assert.equal(failed.worker, 'agent:alice')
+      assert.equal((await task(alice.board, 'c', t + 6)).worker, undefined)
+      await alice.close()
+      await bob.close()
+    })
+
     test('a keyed post is idempotent and a conflicting repost is Exists', async () => {
       const { board, close } = await open(file(), 'alice')
       const t = Date.now()

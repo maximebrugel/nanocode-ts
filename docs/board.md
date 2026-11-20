@@ -67,7 +67,9 @@ await board.finish('summarize', claim, { done: 'two lines' }) // or { failed: 'w
 
 A claim holds the task until `untilMs`, and the holder renews to keep it. Once the lease lapses, anyone can claim the task and gets `tookOver: true`. The old holder's renew, release and finish are then refused (`NotHolder`), so a stalled worker cannot overwrite its replacement. Every call takes an optional `atMs` for tests.
 
-`cap` bounds concurrency. `claim(id, { leaseMs, cap: 4 })` is refused with `Full` (and `rejection.cap`) when 4 other tasks are held, counting only live leases and only within one partition. This is the number form. Board.ts has no label form yet.
+`cap` bounds concurrency. `claim(id, { leaseMs, cap: 4 })` is refused with `Full` (and `rejection.cap`) when 4 other tasks are held, counting only live leases and only within one partition. `cap: { max: 2, label: ['pool', 'lent'] }` counts only held tasks labelled `pool=lent`, whatever the claimed task's own labels, so each label value gets its own limit on one partition. `rejection.cap` has the same shape as the cap that refused the claim.
+
+A finished task keeps the worker that finished it: `task.worker` on a `done` or `failed` task is the actor whose claim finished it.
 
 ## Steer and heed
 

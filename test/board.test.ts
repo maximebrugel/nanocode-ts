@@ -6,18 +6,20 @@ import { join } from 'node:path'
 import { after, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Sql } from 'nanocode-ts/node'
+import { Sql as Postgres } from 'nanocode-ts/postgres'
 import { Board } from 'nanocode-ts/vercel'
 
 // Conformance suite for the Board binding over a SQLite file. Writes pass explicit atMs so
 // lease and backoff timing is exact; work() runs on the wall clock. Several processes share one
 // file by running this same file with NC_BOARD_CHILD set to a JSON role. Actors are agent:<name>.
 
-type Opened = { sql: Sql.Host; board: Board.Board; close(): Promise<void> }
+type Opened = { sql: Sql.Host | Postgres.Host; board: Board.Board; close(): Promise<void> }
 
 const scope = 'conformance'
+const postgres = process.env.NC_BOARD_POSTGRES
 
 async function open(path: string, actor: string): Promise<Opened> {
-  const sql = Sql.open(path)
+  const sql = postgres ? Postgres.open(postgres, { schema: path }) : Sql.open(path)
   const board = await Board.open({ sql, scope, actor: 'agent:' + actor })
   // open() charters a new board for its actor; that first opener lets every agent manage it.
   const granted = await board.grant(
@@ -30,7 +32,7 @@ async function open(path: string, actor: string): Promise<Opened> {
     board,
     async close() {
       await board.close()
-      sql.close()
+      await sql.close()
     },
   }
 }
@@ -148,10 +150,21 @@ if (process.env.NC_BOARD_CHILD) {
 } else {
   const root = mkdtempSync(join(tmpdir(), 'nc-board-'))
   let files = 0
-  const file = () => join(root, 'board-' + files++ + '.sqlite')
-  after(() => rmSync(root, { recursive: true, force: true }))
+  const schemas = 'nc_board_' + process.pid + '_' + Date.now().toString(36)
+  const file = () => (postgres ? schemas + '_' + files++ : join(root, 'board-' + files++ + '.sqlite'))
+  after(async () => {
+    rmSync(root, { recursive: true, force: true })
+    if (!postgres) return
+    const admin = Postgres.open(postgres)
+    try {
+      for (let index = 0; index < files; index++)
+        await admin.transaction('log', 'drop', [['DROP SCHEMA IF EXISTS ' + schemas + '_' + index + ' CASCADE']], 'schema')
+    } finally {
+      await admin.close()
+    }
+  })
 
-  describe('Board over node:sqlite', { timeout: 180_000 }, () => {
+  describe(postgres ? 'Board over Postgres' : 'Board over node:sqlite', { timeout: 180_000 }, () => {
     test('needs keep a task Waiting until they are done', async () => {
       const { board, close } = await open(file(), 'alice')
       const t = Date.now()

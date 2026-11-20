@@ -39,6 +39,10 @@
       "types": "./dist/node/index.d.ts",
       "default": "./dist/node/index.js"
     },
+    "./postgres": {
+      "types": "./dist/postgres/index.d.ts",
+      "default": "./dist/postgres/index.js"
+    },
     "./cloudflare": {
       "types": "./dist/cloudflare/index.d.ts",
       "default": "./dist/cloudflare/index.js"
@@ -136,6 +140,7 @@
     "@vercel/oidc": "^3.2.0",
     "@vercel/sandbox": "^3.9.0",
     "durable-harness": "0.0.1-beta.6",
+    "postgres": "^4.1.1",
     "react": "^19.0.0"
   },
   "peerDependenciesMeta": {
@@ -151,6 +156,9 @@
     "durable-harness": {
       "optional": true
     },
+    "postgres": {
+      "optional": true
+    },
     "react": {
       "optional": true
     }
@@ -163,6 +171,7 @@
     "@vercel/oidc": "3.2.0",
     "@vercel/sandbox": "3.9.0",
     "durable-harness": "0.0.1-beta.6",
+    "postgres": "4.1.1",
     "rolldown": "1.2.15",
     "typescript": "6.0.2",
     "vite-plus": "0.2.4",

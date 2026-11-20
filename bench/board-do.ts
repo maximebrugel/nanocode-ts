@@ -149,9 +149,12 @@ const round = (value: number | null | undefined, places = 2) =>
 
 const median = (values: readonly number[]) => quantile(values, 0.5)
 
+// In-object times come from workerd's clock, which runs in real time at 1 ms resolution: their
+// means are sound, their percentiles are whole milliseconds.
 function spread(values: readonly number[]) {
   return {
     n: values.length,
+    mean: round(values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length), 3),
     p50: round(quantile(values, 0.5)),
     p95: round(quantile(values, 0.95)),
     p99: round(quantile(values, 0.99)),

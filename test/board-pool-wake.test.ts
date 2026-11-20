@@ -14,7 +14,15 @@ const pollMs = 5_000
 const count = 20
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-type Role = { url: string; schema: string; scope: string; actor: string; wake: boolean }
+type Role = {
+  url: string
+  schema: string
+  scope: string
+  actor: string
+  wake: boolean
+  // Holds every task it claims under this lease until killed, instead of finishing it.
+  hold?: number
+}
 
 async function child(role: Role) {
   const emit = (line: object) => process.stdout.write(JSON.stringify(line) + '\n')
@@ -33,7 +41,7 @@ async function child(role: Role) {
   }
   const pool = Board.pool(board, {
     concurrency: 2,
-    leaseMs: 30_000,
+    leaseMs: role.hold ?? 30_000,
     pollMs,
     wake: role.wake
       ? (notify) =>
@@ -43,7 +51,11 @@ async function child(role: Role) {
             notify()
           })
       : undefined,
-    async run() {
+    async run(task) {
+      if (role.hold !== undefined) {
+        emit({ e: 'start', task: task.id })
+        await new Promise(() => {})
+      }
       await sleep(5)
       return { done: role.actor }
     },
@@ -139,15 +151,23 @@ if (process.env.NC_WAKE_CHILD) {
       children.add(proc)
       let err = ''
       proc.stderr!.on('data', (chunk: Buffer) => (err += chunk.toString()))
+      let held = () => {}
+      const holding = new Promise<void>((resolve) => (held = resolve))
       const ready = new Promise<void>((resolve, reject) => {
         createInterface({ input: proc.stdout! }).on('line', (line) => {
           if (line.includes('"ready"')) resolve()
+          if (line.includes('"start"')) held()
         })
         proc.on('close', (code) => reject(new Error('child exited ' + code + '\n' + err)))
       })
       const exited = new Promise<void>((resolve) => proc.on('close', () => resolve()))
       return {
         ready,
+        holding,
+        kill() {
+          proc.kill('SIGKILL')
+          children.delete(proc)
+        },
         async stop() {
           proc.kill('SIGTERM')
           await Promise.race([exited, sleep(5_000)])
@@ -203,6 +223,55 @@ if (process.env.NC_WAKE_CHILD) {
         const elapsed = await drain(false)
         process.stdout.write('# poll drain ' + elapsed + ' ms\n')
         assert.ok(elapsed > pollMs / 2, 'drained in ' + elapsed + ' ms')
+      })
+
+      test("with wake a killed holder's task is taken over about when its lease ends", async () => {
+        const schema = 'nc_board_wake_lapse_' + process.pid
+        schemas.push(schema)
+        const scope = 'lapse'
+        const leaseMs = 1_000
+        const sql = Sql.open(url, { schema, max: 2 })
+        const board = await Board.open({ sql, scope, actor: 'agent:parent' })
+        const granted = await board.grant(
+          { who: [{ kind: 'kind', id: 'agent' }], can: { '*': ['manage'] } },
+          { key: 'grant-agents' },
+        )
+        assert.ok(granted.ok, JSON.stringify(granted))
+        assert.ok((await board.post({ id: 'orphan', spec: 'its holder dies' })).ok)
+        const holder = start({ url, schema, scope, actor: 'holder', wake: true, hold: leaseMs })
+        // ready rejects when the kill below ends the holder.
+        holder.ready.catch(() => {})
+        await holder.holding
+        let takenAt: number | undefined
+        let tookOver = false
+        // pollMs 5000 and no notification for a lapse: only the lease timer can be this quick.
+        const pool = Board.pool(board, {
+          concurrency: 2,
+          leaseMs,
+          pollMs,
+          wake: Sql.wake(sql),
+          async run(_, lease) {
+            takenAt = Date.now()
+            tookOver = lease.tookOver
+            return { done: 'parent' }
+          },
+        })
+        // Let the holder renew a few times, so the pool re-arms its timer on later leases.
+        await sleep(leaseMs * 1.5)
+        assert.equal(takenAt, undefined)
+        const killedAt = Date.now()
+        holder.kill()
+        while (takenAt === undefined) {
+          assert.ok(Date.now() - killedAt < pollMs, 'not taken over before pollMs')
+          await sleep(5)
+        }
+        const elapsed = takenAt - killedAt
+        process.stdout.write('# lapse takeover ' + elapsed + ' ms after the kill\n')
+        assert.ok(tookOver)
+        assert.ok(elapsed < leaseMs + 100, 'taken over ' + elapsed + ' ms after the kill')
+        await pool.stop()
+        await board.close()
+        await sql.close()
       })
 
       test("a pool's own writes wake only the pools own names", async () => {

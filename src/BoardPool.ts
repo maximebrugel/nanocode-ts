@@ -18,8 +18,10 @@ export type PoolOptions = {
   run: (task: Board.Task, lease: PoolLease) => Promise<Board.Outcome>
   /**
    * Subscribes to new work on the board: the pool polls as soon as notify fires, and still every
-   * pollMs as a fallback. Returns the unsubscribe the pool calls when it stops or retires. Postgres
-   * hosts give one with nanocode-ts/postgres Sql.wake; node:sqlite has none and keeps polling.
+   * pollMs as a fallback. A lapse writes nothing, so while it has a free slot the pool also polls
+   * 5 ms after the soonest lease it sees on another holder's task ends, when that comes before
+   * pollMs. Returns the unsubscribe the pool calls when it stops or retires. Postgres hosts give
+   * one with nanocode-ts/postgres Sql.wake; node:sqlite has none and keeps polling.
    */
   wake?: ((notify: () => void) => PoolWake) | undefined
 }
@@ -129,6 +131,9 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
   let waiters: (() => void)[] = []
   let idleSince: number | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
+  // With wake, when the next lease another holder has here ends: a lapse writes nothing, so no
+  // notification would announce it.
+  let lapseAt: number | undefined
   let ticking: Promise<void> | undefined
   let again = false
   let stopping: Promise<void> | undefined
@@ -311,6 +316,16 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
           start(task, claimed)
         }
       }
+      lapseAt = undefined
+      if (options.wake && stats.state === 'running' && running.size < concurrency) {
+        const now = Date.now()
+        for (const task of await board.held()) {
+          // A lease already past is ready work, which this tick claimed or a cap holds back.
+          if (running.has(task.id) || task.untilMs === undefined || task.untilMs <= now) continue
+          if (label && task.labels[label[0]] !== label[1]) continue
+          if (lapseAt === undefined || task.untilMs < lapseAt) lapseAt = task.untilMs
+        }
+      }
     } catch (cause) {
       error(cause)
     }
@@ -326,11 +341,15 @@ export function pool(board: Board.Board, options: PoolOptions): Pool {
 
   const unschedule = () => {
     if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
   }
 
   const schedule = () => {
     unschedule()
-    if (stats.state === 'running') timer = setTimeout(kick, pollMs)
+    if (stats.state !== 'running') return
+    // 5 ms past the lease's end, so the claim lands after the lapse rather than on a live lease.
+    const lapse = lapseAt === undefined ? pollMs : Math.max(0, lapseAt + 5 - Date.now())
+    timer = setTimeout(kick, Math.min(pollMs, lapse))
   }
 
   function kick() {

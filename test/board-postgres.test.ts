@@ -40,6 +40,27 @@ describe('Postgres statement translation', () => {
   })
 })
 
+describe('Postgres reconnect backoff', () => {
+  test('defaults to 50 ms doubling up to 1 s', () => {
+    assert.deepEqual([1, 2, 3, 4, 5, 9].map(Sql.reconnect), [0.1, 0.2, 0.4, 0.8, 1, 1])
+  })
+
+  test('Sql.open takes its own backoff, which a failed connect consults', async () => {
+    const attempts: number[] = []
+    // Port 1 refuses the connection, so no server is needed.
+    const host = Sql.open('postgres://nobody@127.0.0.1:1/none', {
+      backoff: (attempt) => (attempts.push(attempt), 0.01),
+    })
+    await assert.rejects(host.transaction('log', 'get', [['SELECT 1']], 'read'))
+    assert.ok(attempts.length > 0 && attempts[0] === 1, JSON.stringify(attempts))
+    await host.close()
+    assert.throws(
+      () => Sql.open('postgres://nobody@127.0.0.1:1/none', { backoff: 1 as never }),
+      /backoff must be a function/,
+    )
+  })
+})
+
 if (!url) {
   test('Board over Postgres', { skip: 'DATABASE_URL is not set' }, () => {})
 } else {

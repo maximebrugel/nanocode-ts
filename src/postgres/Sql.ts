@@ -25,7 +25,16 @@ export type Options = {
   valueLimit?: number
   /** The shortest gap, in ms, between two nanocode_log notifications this host sends (default 10). */
   notifyMs?: number
+  /**
+   * Seconds to wait before the nth attempt to reconnect, as postgres.js's backoff (default
+   * reconnect: 0.1, 0.2, 0.4 and 0.8 s, then every second). postgres.js's own grows as 3^n / 100 s
+   * with jitter, up to 20 s.
+   */
+  backoff?: (attempt: number) => number
 }
+
+/** The default Options.backoff: 0.05 * 2^n seconds, capped at 1 s. */
+export const reconnect = (attempt: number) => Math.min(0.05 * 2 ** attempt, 1)
 
 const twins: ReadonlyMap<string, string> = new Map([
   ['SELECT NULL', 'SELECT pg_advisory_xact_lock(7061636193)'],
@@ -148,9 +157,12 @@ export function open(url: string, options: Options = {}): Host {
   const notifyMs = options.notifyMs ?? 10
   if (!Number.isFinite(notifyMs) || notifyMs < 0)
     throw new Error('notifyMs must be a non-negative number')
+  const backoff = options.backoff ?? reconnect
+  if (typeof backoff !== 'function') throw new Error('backoff must be a function')
 
   const sql = postgres(url, {
     ...(max === undefined ? {} : { max }),
+    backoff,
     onnotice: () => {},
     ...(schema === undefined ? {} : { connection: { search_path: '"' + schema + '"' } }),
   })

@@ -425,7 +425,11 @@ async function load(config: Config, mode: Mode, clients: number) {
     claimsPerSecond: round(claims / seconds, 1),
     clients,
     heeded,
-    inside: { claim: spread(inside.claim), finish: spread(inside.finish), renew: spread(inside.renew) },
+    inside: {
+      claim: spread(inside.claim),
+      finish: spread(inside.finish),
+      renew: spread(inside.renew),
+    },
     misses,
     mode,
     operations,

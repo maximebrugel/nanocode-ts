@@ -198,12 +198,25 @@ Open is measured over fetch and includes one round trip (about 1 ms); the time i
 1–5 ms of it. Growth between sizes, as (open time ratio) / (event ratio), is 0.91, 0.93, 1.01, 1.01, 1.04, 1.00.
 The restart itself (`ctx.abort()` and the first request to the new instance) takes 3–8 ms.
 
+A second replay pass on `bench-c056` (same CPU, 4 leased cores, quieter: 40 of 48 cores leased) at 8b87fa6
+splits the open into the SQL read of the log and the fold:
+
+| events | open ms | of which SQL read ms | first `tasks()` ms | first write ms | violations |
+|---|---|---|---|---|---|
+| 1,033 | 15.6 | 1 | 2.5 | 5.0 | 0 |
+| 10,072 | 94.9 | 5 | 18.0 | 5.8 | 0 |
+| 50,093 | 439 | 26 | 87.3 | 6.1 | 0 |
+
+Here open costs about 8.8 ms per 1k events (growth ratio 0.93 from 10k to 50k), half the loaded box's rate, and
+the SQL read is about 6% of it: the fold of the events into the board's state is the cost, not SQLite.
+
 ## Findings
 
 - **Correctness held everywhere.** 15,120 tasks over 6 load cells and 24,751 in the replay object: each finished
   exactly once, as `done`, and the board's view agreed.
 - **Replay is linear, with no cliff up to 100k events, but nothing bounds it.** `Board.open` costs about 16.8 ms
-  per 1k events, and the first full read another 3.2 ms per 1k. Since a swarm reopens the board on every wake, a
+  per 1k events on the loaded box (8.8 on a quieter one), about 94% of it the fold rather than the SQL read, and
+  the first full read another 3.2 ms per 1k. Since a swarm reopens the board on every wake, a
   wake costs 0.23 s at 10k events (about 120 swarms of 21 tasks), 1.16 s at 50k and 2.3 s at 100k before any
   work. There is no snapshot or compaction, so a long-lived object pays for its whole history on each wake.
 - **`tasks()` is O(tasks)**: about 11 µs per task warm (282 ms at 24,751 tasks). A first write after a wake grows

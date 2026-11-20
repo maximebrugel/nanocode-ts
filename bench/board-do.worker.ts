@@ -182,7 +182,8 @@ export class BoardObject extends DurableObject<Env> {
       const last = (await board.steers(id, claim)).at(-1)
       if (last) {
         const verdict = await board.heed(id, claim, last.seq)
-        if (!verdict.ok) return { ok: false, refreshMs, rejection: 'heed ' + verdict.rejection.kind }
+        if (!verdict.ok)
+          return { ok: false, refreshMs, rejection: 'heed ' + verdict.rejection.kind }
         heeded++
       }
       const verdict = await board.finish(id, claim, { done: client })

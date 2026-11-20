@@ -119,7 +119,8 @@ type S = { name: string; context: any; page: any; mode: Mode; first: boolean }
 // ?live= pointing at the local relay.
 async function session(name: string, m: Mode = mode): Promise<S> {
   const context = await browser.newContext({ viewport: { width: 1280, height: 860 } })
-  if (m === 'cookie') await context.addCookies([{ name: SESSION_COOKIE, value: token, url: WEB, secure: true, httpOnly: true, sameSite: 'Lax' }])
+  // __Host- needs Secure, path / and no Domain; Chromium treats a loopback http origin as secure.
+  if (m === 'cookie') await context.addCookies([{ name: SESSION_COOKIE, value: token, domain: new URL(WEB).hostname, path: '/', secure: true, httpOnly: true, sameSite: 'Lax' }])
   await context.addInitScript(
     ([t, l]: string[]) => {
       try {
@@ -231,7 +232,14 @@ async function auth() {
   const order: Mode[] = process.env.LIVE ? [mode] : ['token', 'query', 'cookie', 'relay']
   let picked: Mode | null = null
   for (const m of order) {
-    const s = await session('auth-' + m, m)
+    let s: S
+    try {
+      s = await session('auth-' + m, m)
+    } catch (e: any) {
+      tried[m] = { ok: false, error: String(e?.message ?? e).split('\n')[0].slice(0, 200) }
+      step(m + ' ' + JSON.stringify(tried[m]))
+      continue
+    }
     const t0 = Date.now()
     let synced: number | null = null
     try {

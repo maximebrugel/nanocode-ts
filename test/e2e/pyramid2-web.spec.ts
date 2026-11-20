@@ -47,6 +47,9 @@ async function v1(path: string, init: any = {}) {
     const res = await fetch(NODES[0] + '/v1' + path, {
       ...init,
       headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', ...(init.headers ?? {}) },
+    }).catch((e: any) => {
+      if (refused(e)) noteDown(NODES[0], 'ECONNREFUSED ' + path)
+      throw e
     })
     if (res.status === 503 && attempt < 5) {
       await res.text().catch(() => '')
@@ -80,6 +83,42 @@ async function answered(thread: string, needle: string) {
   return snap.messages.some((m: any) => m.role === 'assistant' && JSON.stringify(m).includes(needle))
 }
 
+// Node restarts: each node's /readyz is polled every second (and a fetch that fails with ECONNREFUSED counts too); a
+// down period is recorded with timestamps, and a phase that overlaps one is confounded (and not ok).
+type Restart = { node: string; down_at: string; up_at: string | null; down_ms: number; up_ms: number | null; reason: string }
+const restarts: Restart[] = []
+const downNow = new Map<string, Restart>()
+function noteDown(node: string, reason: string) {
+  if (downNow.has(node)) return
+  const r: Restart = { node, down_at: new Date().toISOString(), up_at: null, down_ms: Date.now(), up_ms: null, reason }
+  downNow.set(node, r)
+  restarts.push(r)
+}
+function noteUp(node: string) {
+  const r = downNow.get(node)
+  if (!r) return
+  r.up_at = new Date().toISOString()
+  r.up_ms = Date.now()
+  downNow.delete(node)
+}
+const refused = (e: any) => /ECONNREFUSED/.test(String(e?.cause?.code ?? e?.code ?? '') + String(e?.cause?.message ?? e?.message ?? ''))
+let polling = true
+const poller = (async () => {
+  while (polling) {
+    await Promise.all(
+      NODES.map(async (n) => {
+        try {
+          const res = await fetch(n + '/readyz', { signal: AbortSignal.timeout(2000) })
+          await res.text().catch(() => '')
+          res.ok ? noteUp(n) : noteDown(n, 'readyz ' + res.status)
+        } catch (e: any) {
+          noteDown(n, refused(e) ? 'ECONNREFUSED' : 'readyz ' + String(e?.cause?.code ?? e?.message ?? e).slice(0, 80))
+        }
+      }),
+    )
+    await sleep(1000)
+  }
+})()
 const blocked = new Set<string>()
 const sockets = new Map<string, Set<WebSocket>>()
 const frames = new Map<string, number>()
@@ -253,8 +292,10 @@ async function auth() {
     const live = await s.page.evaluate(() => sessionStorage.getItem('pyramid2-web.live')).catch(() => null)
     await shot(s.page, 'auth-' + m)
     await s.context.close()
-    const ok = synced != null && !/Fixture/i.test(c) && board != null
-    tried[m] = { ok, chip: c, synced_ms: synced, fixture: /Fixture/i.test(c), seed_thread_on_board_ms: board, thread_links: links, live_override: live ? 'relay' : 'same-origin', http }
+    const reachedSynced = synced != null && /^Synced/.test(c)
+    const syncedWithoutData = reachedSynced && board == null
+    const ok = reachedSynced && !/Fixture/i.test(c) && board != null
+    tried[m] = { ok, synced_without_data: syncedWithoutData, chip: c, synced_ms: synced, fixture: /Fixture/i.test(c), seed_thread_on_board_ms: board, thread_links: links, live_override: live ? 'relay' : 'same-origin', http }
     step(m + ' ' + JSON.stringify(tried[m]))
     if (ok && !picked) {
       picked = m
@@ -264,7 +305,7 @@ async function auth() {
   if (!picked) throw new Error('no live mode synced: ' + JSON.stringify(tried))
   mode = picked
   result.mode = mode
-  return { mode, tried, token_login_authenticates_live: !!(tried.token?.ok || tried.query?.ok) }
+  return { mode, tried, synced_without_data: Object.keys(tried).filter((k) => tried[k].synced_without_data), token_login_authenticates_live: !!(tried.token?.ok || tried.query?.ok) }
 }
 
 async function basic() {
@@ -380,7 +421,10 @@ async function blip() {
     return all.every((x) => [...marks, ...thr].every((m) => x[m] != null))
   }, 60_000, 100).catch(() => {})
   const all = await Promise.all(ss.map((s) => seen(s.page)))
-  const catchUp = all.map((x) => Math.max(...[...marks, ...thr].map((m) => (x[m] ?? NaN) - tOn)))
+  const catchUp = all.map((x) => {
+    const v = Math.max(...[...marks, ...thr].map((m) => (x[m] ?? NaN) - tOn))
+    return Number.isFinite(v) ? v : null
+  })
   for (const m of marks) await until('answer ' + m, () => answered(watched, m), 60_000, 500).catch(() => {})
   await sleep(4000)
   const counts: string[] = []
@@ -392,7 +436,14 @@ async function blip() {
   const chips = await Promise.all(ss.map((s) => chip(s.page)))
   await shot(ss[0].page, 'blip-2-back')
   await closeAll(ss)
-  return { panes_rendered: panes.filter((x) => x.rendered).length, offline_chips: offChips, catch_up_ms: catchUp, missing: all.map((x) => [...marks, ...thr].filter((m) => x[m] == null).length), user_message_not_exactly_once: counts, stuck: st, chips }
+  const missing = all.map((x) => [...marks, ...thr].filter((m) => x[m] == null).length)
+  const failures: string[] = []
+  ss.forEach((s, i) => {
+    if (catchUp[i] == null) failures.push(s.name + ' catch_up_ms is null')
+    if (missing[i] > 0) failures.push(s.name + ' missing ' + missing[i] + ' posted item(s) after reconnect')
+  })
+  if (counts.length) failures.push('duplicated or missing after reconnect: ' + counts.slice(0, 10).join(', '))
+  return { panes_rendered: panes.filter((x) => x.rendered).length, offline_chips: offChips, catch_up_ms: catchUp, missing, user_message_not_exactly_once: counts, stuck: st, chips, failures }
 }
 
 async function reload() {
@@ -433,7 +484,8 @@ async function reload() {
 async function subagents() {
   const id = await newThread()
   const tag = 'sub' + randomUUID().slice(0, 6)
-  await turn(id, 'e2e:swarm 4 ' + tag)
+  const SWARM = 4
+  await turn(id, 'e2e:swarm ' + SWARM + ' ' + tag)
   // The API first: the snapshot's thread.subagents lists the running children.
   let apiMax = 0, apiFirst: number | null = null
   const t0 = Date.now()
@@ -442,9 +494,9 @@ async function subagents() {
     const n = (snap.thread?.subagents ?? []).length
     if (n > apiMax) apiMax = n
     if (n > 0 && apiFirst == null) apiFirst = Date.now() - t0
-    return apiMax >= 4
+    return apiMax >= SWARM
   }, 60_000, 300).catch(() => {})
-  const api = { max_running_subagents: apiMax, first_row_ms: apiFirst }
+  const api = { max_running_subagents: apiMax, first_row_ms: apiFirst, requested: SWARM }
   step('api ' + JSON.stringify(api))
   const s = await session('subagents')
   await open(s, '/t/' + encodeURIComponent(id))
@@ -452,7 +504,7 @@ async function subagents() {
   let children = 0
   await until('children on the board', async () => {
     children = await s.page.locator('section[aria-labelledby="s-threads"] a[href^="/t/"]').count()
-    return children >= 4
+    return children >= SWARM
   }, 90_000, 500).catch(() => {})
   await shot(s.page, 'subagents-2-board')
   const sections = await s.page.locator('main h2').allInnerTexts()
@@ -465,7 +517,10 @@ async function subagents() {
   await shot(s.page, 'subagents-3-thread')
   const st = await stuck(s.page)
   await s.context.close()
-  return { thread: id, api, child_links_on_board: children, sections, articles, shows_children_done: /child \d+ done/.test(text), stuck: st }
+  const failures: string[] = []
+  if (apiMax < SWARM) failures.push('max_running_subagents ' + apiMax + ' < requested ' + SWARM)
+  if (children === 0) failures.push('no child shows on the board')
+  return { thread: id, api, child_links_on_board: children, sections, articles, shows_children_done: /child \d+ done/.test(text), stuck: st, failures }
 }
 
 async function soak() {
@@ -502,11 +557,20 @@ try {
     scenario = p
     step('start')
     const t = Date.now()
+    const confound = () => {
+      const end = Date.now()
+      const hit = restarts.filter((r) => r.down_ms <= end && (r.up_ms ?? end) >= t)
+      return { confounded: hit.length > 0, ...(hit.length ? { restarts: hit.map(({ node, down_at, up_at, reason }) => ({ node, down_at, up_at, reason })) } : {}) }
+    }
     try {
-      result.phases[p] = { ok: true, ...(await run[p]()), ms: Date.now() - t }
+      const out = await run[p]()
+      const c = confound()
+      const bad = (out.failures?.length ?? 0) > 0 || c.confounded
+      if (bad) failed = true
+      result.phases[p] = { ok: !bad, ...out, ...c, ms: Date.now() - t }
     } catch (e: any) {
       failed = true
-      result.phases[p] = { ok: false, error: String(e?.stack ?? e).slice(0, 1500), ms: Date.now() - t, evidence: await evidence(p).catch(() => []) }
+      result.phases[p] = { ok: false, error: String(e?.stack ?? e).slice(0, 1500), ms: Date.now() - t, ...confound(), evidence: await evidence(p).catch(() => []) }
     }
     await closeAll([...opened])
     for (const [k, v] of frames) frames.delete(k), ((result.frames ??= {})[p + ':' + k] = v)
@@ -515,6 +579,9 @@ try {
   }
 } finally {
   clearTimeout(guard)
+  polling = false
+  await poller
+  result.node_restarts = restarts.map(({ node, down_at, up_at, reason }) => ({ node, down_at, up_at, reason }))
   await browser.close()
   wss.close()
   result.ended = new Date().toISOString()

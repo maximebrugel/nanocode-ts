@@ -390,7 +390,9 @@ async function swarm(url: string, seed: number, out: string) {
   // What each SIGSTOPped worker held when it was paused, and when it was let go again.
   const pausedWith = new Map<string, { at: number; tasks: Set<string> }>()
   const resumedAt = new Map<string, number>()
-  const resumedFinishes: { actor: string; task: string; at: number }[] = []
+  const resumedFinishes: { actor: string; task: string; at: number; startedAt: number }[] = []
+  // When each worker last started each task, that is, took the claim a later finish lands on.
+  const startedAt = new Map<string, number>()
   const slots: Slot[] = []
   const incarnations: number[] = []
   const stats: Board.PoolStats[] = []
@@ -431,7 +433,10 @@ async function swarm(url: string, seed: number, out: string) {
         return void note(name, 'stdout', { text })
       }
       timeline.push({ ...line, who: name })
-      if (line.e === 'start' && line.task) slot.held.add(line.task)
+      if (line.e === 'start' && line.task) {
+        slot.held.add(line.task)
+        startedAt.set(name + ' ' + line.task, line.at)
+      }
       if ((line.e === 'finish' || line.e === 'renew') && line.task) {
         slot.held.delete(line.task)
         const resumed = resumedAt.get(name)
@@ -440,7 +445,12 @@ async function swarm(url: string, seed: number, out: string) {
           const paused = pausedWith.get(name)?.tasks.has(line.task) ?? false
           if (paused && line.ok === false) counts.resumedRefused++
           else if (paused && line.e === 'finish')
-            resumedFinishes.push({ actor: 'agent:' + name, task: line.task, at: line.at })
+            resumedFinishes.push({
+              actor: 'agent:' + name,
+              task: line.task,
+              at: line.at,
+              startedAt: startedAt.get(name + ' ' + line.task) ?? 0,
+            })
         }
       }
       if (line.e === 'stats') stats.push(line.stats as Board.PoolStats)
@@ -581,19 +591,16 @@ async function swarm(url: string, seed: number, out: string) {
   // A paused holder may still finish the task it held if nobody took it over while it slept, or
   // after claiming it afresh once a later holder's lease lapsed too. A finish on the claim it held
   // before the pause, after a takeover, is the bug this hunts: the claim-id audit above catches it,
-  // and this flags a resumed finish that neither case explains.
+  // and this flags a resumed finish that neither case explains. The claim a finish lands on is the
+  // one its run started on, recorded when the finish was seen: a worker paused more than once may
+  // have lost the task at its first pause and retaken it before a later one.
   for (const finish of resumedFinishes) {
-    const name = finish.actor.slice('agent:'.length)
-    const stoppedAt = pausedWith.get(name)?.at ?? 0
-    const taken = result.takeovers.some(
+    const taken = result.takeovers.filter(
       (takeover) => takeover.task === finish.task && takeover.from === finish.actor,
     )
-    const retook = result.takeovers.some(
-      (takeover) =>
-        takeover.task === finish.task && takeover.to === finish.actor && takeover.at >= stoppedAt,
-    )
+    const retook = taken.length > 0 && taken.every((takeover) => takeover.at < finish.startedAt)
     if (retook) counts.resumedRetook++
-    else if (taken)
+    else if (taken.length > 0)
       violations.push(
         finish.actor +
           ' finished ' +

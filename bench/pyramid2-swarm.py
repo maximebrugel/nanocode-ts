@@ -50,11 +50,17 @@ def scrape(ops):
     return out
 
 
+GAUGES = re.compile(r"^pyramid2_(turns_active|lease_epoch|lease_phase)")
+
+
 def delta(before, after):
+    # Counters as after - before; gauges as [before, after] (a gauge delta such as turns_active 7 -> 0 is not
+    # the gauge going negative).
     out = {}
     for node in after:
         b, a = before.get(node, {}), after[node]
-        out[node] = {k: round(v - b.get(k, 0), 3) for k, v in a.items() if k != "error" and v != b.get(k, 0)}
+        out[node] = {k: ([b.get(k), v] if GAUGES.match(k.split("{", 1)[0]) else round(v - b.get(k, 0), 3))
+                     for k, v in a.items() if k != "error" and v != b.get(k, 0)}
         if "error" in a:
             out[node]["error"] = a["error"]
     return out

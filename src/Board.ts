@@ -175,9 +175,8 @@ export type Board = {
 }
 
 export async function open(options: Options): Promise<Board> {
-  if (!options.module)
-    throw new Error("Board.open needs a module here; import Board from 'nanocode-ts/vercel' to load the bundled one")
-  const runtime = await AgentRuntime.instantiate(options.module, options.sql, { published() {} })
+  const module = options.module ?? (await (await import('./vercel/Wasm.ts')).load())
+  const runtime = await AgentRuntime.instantiate(module, options.sql, { published() {} })
   try {
     const board = (await runtime.board({
       open: { scope: options.scope, actor: options.actor, partitions: options.partitions ?? 1 },

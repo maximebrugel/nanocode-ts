@@ -1227,3 +1227,28 @@ SHIPPY_REMOTE_BUILD=0 npm test -- --test-concurrency=2 --test-reporter=tap
 
 A clean checkout still requires npm dependencies, matching WASM inputs, and PostgreSQL binaries or an explicit test database.
 No new WASM release was published by this change.
+
+## 2026-11-22: Manual full-suite CI builds its exact test module
+
+`full-suite.yml` accepts only a confirmed master SHA and checks out the SDK revision from `sdk-revision.json`.
+The job acquires npm dependencies, Rust 1.97.1, the WASM target, and locked Cargo sources before compilation.
+The compiler runs in a Linux network namespace through `sudo unshare --net`.
+A namespace failure stops the job without a network-enabled fallback.
+Cargo also uses locked offline mode, four jobs, and the existing compiler wrappers.
+
+The job records the module fingerprint, SHA256, source SHA, and SDK revision in a module-only test receipt.
+It runs the unfiltered `npm test` with a real, digest-pinned PostgreSQL 16 service.
+No release bundle, tag, or package is published.
+The manual trigger leaves the existing release and CI workflows unchanged.
+
+All actions use immutable commit pins, checkout credentials are not retained, and repository access is read-only.
+The public secure-runner action receives only its required additional identity permission.
+The Aegis service must be active before source acquisition.
+`actionlint` passed, and `zizmor --offline --persona auditor` reported no findings.
+Twenty-one focused workflow checks passed, including actual OS network denial and wrapper forwarding with a mocked Cargo command.
+That focused check is not a Rust build or an Actions run.
+
+The repository Actions setting returned `enabled: false`.
+The allowed-actions endpoint returned HTTP 409: `GitHub Actions is disabled on this repository by the organization`.
+No organization policy change or workflow dispatch was attempted.
+A real CI run remains blocked by that policy.

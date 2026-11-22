@@ -1180,3 +1180,50 @@ done
 ```
 
 `npm run check:types`, `npm run build:ts`, standalone strict checking of the replay entrypoint with repository compiler options, focused lint/format checks and `git diff --check` passed. Enabling additional `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess` flags reports 1043 errors in unchanged imported source files, not in the replay entrypoint. Those options are absent from this checkout's tsconfig. No Rust build, model request, wallet call or artifact publication ran. Model-based prose lint was omitted because this work excludes model calls.
+
+## 2026-11-22: Full tests require verified local runtime and database inputs
+
+`npm test` validates the local Board WASM fingerprint and SHA256 before it builds TypeScript or starts tests.
+A normal release uses `dist/nanocode-wasm.json`.
+`NANOCODE_TEST_WASM_RECEIPT` selects an explicit local build receipt with the same fingerprint and module digest fields.
+A module-only receipt qualifies only `nanocode_wasm.wasm`, not the seven-file release bundle.
+Tests neither download assets nor build Rust.
+Acquisition remains a separate `node scripts/prepare.mjs` operation or an explicit source build.
+
+The runner checks `DATABASE_URL` when supplied.
+Otherwise it starts a real, temporary PostgreSQL cluster from `PG_BINDIR`, or the directory reported by `pg_config --bindir`.
+The cluster listens only on its private Unix socket and stops after the test process exits, including failure.
+Missing server binaries and an unavailable database fail setup instead of omitting the Postgres checks.
+Node test options precede test paths, so `npm test -- --test-concurrency=2 --test-reporter=tap` applies both options.
+
+The previous 78-case result contained 46 passes, 25 failures, four cancellations, and three database skips.
+Each failure lacked `dist/nanocode_wasm.wasm`.
+The four Cloudflare cases were cancelled by the same absent module in their setup hook.
+No runtime logic defect was demonstrated by those results.
+
+The current source fingerprint is `b395d31a3747a151fc55`, with SDK revision `d16fb837b0b710f446702a21f451a5e1defcdce8`.
+Its published WASM release returned HTTP 404, so no older runtime was substituted.
+An explicit Rust 1.97.1 build used `cargo build --locked --offline --lib --target wasm32-unknown-unknown --profile wasm -j4`.
+It preserved compiler wrappers and used `SHIPPY_REMOTE_BUILD=0`, `CARGO_BUILD_JOBS=4`, and a four-CPU affinity.
+Cargo used offline mode, but the build host refused OS network isolation.
+The module SHA256 is `0516434b77ffd832f624d11fb5c08956d5ace721a8afc9c2d44a0a3e52e4726f` at 34990743 bytes.
+This is the Cargo profile output, without a Binaryen pass or a complete release manifest.
+
+Two full runs each passed 106 tests with zero failures, cancellations, or skips.
+The second run created and stopped its own temporary PostgreSQL cluster.
+It used real PostgreSQL 16.16 and workerd 1.20261120.1, including the existing multiprocess fuzz and restart checks.
+The additional six cases check the fixture guard against the current real module, changed content, missing inputs, and invalid receipts.
+A negative control that removed validation failed five cases, as expected.
+Runtime checks used Node 24.22.3 and npm 11.19.1 in a network namespace with only loopback enabled.
+An external fetch failed in that namespace.
+
+With already acquired local inputs, the full runner needs no network or Rust compiler:
+
+```sh
+NANOCODE_TEST_WASM_RECEIPT=/path/to/module-receipt.json \
+PG_BINDIR=/path/to/postgresql/bin \
+SHIPPY_REMOTE_BUILD=0 npm test -- --test-concurrency=2 --test-reporter=tap
+```
+
+A clean checkout still requires npm dependencies, matching WASM inputs, and PostgreSQL binaries or an explicit test database.
+No new WASM release was published by this change.

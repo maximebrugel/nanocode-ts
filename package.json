@@ -23,7 +23,7 @@
     "example:board-postgres:soak": "node examples/board-postgres/soak.ts",
     "check:types": "tsc --noEmit && tsc --noEmit -p tsconfig.vercel.json && tsc --noEmit -p tsconfig.cloudflare.json && tsc --noEmit -p examples/board-agents && tsc --noEmit -p examples/board-durable-object && tsc --noEmit -p examples/board-durable-object/tsconfig.worker.json && tsc --noEmit -p examples/board-postgres",
     "prepare": "node scripts/prepare.mjs",
-    "test": "node --test 'test/bash-jq.test.ts' 'test/board*.test.ts' 'test/session-lifecycle.test.ts'"
+    "test": "node scripts/test.ts"
   },
   "exports": {
     ".": {

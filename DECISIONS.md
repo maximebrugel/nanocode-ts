@@ -1130,3 +1130,30 @@ Until Actions is turned on, nothing in the workflows is relied on.
 The one rewrite that changes behavior is `unicorn(no-useless-spread)` in `src/bash/internal/commands/jq.ts`: `match`, `test` and `capture` report jq offsets and lengths in code points, `[...input.slice(0, i)].length`, and the fix turns that into `input.slice(0, i).length`, UTF-16 units, so any text with a character outside the BMP before a match shifts every offset. `vite.config.ts` turns that rule off for `jq.ts` with a lint override rather than letting the fix run. The rule's other warnings (`zip.ts`, `Shell.ts`, and the `[...this.paths(...)]` snapshots in `jq.ts`) copy a collection before mutating or awaiting on purpose, and `--fix` does not apply those.
 
 After this change `vp check --fix` leaves `git status` clean. Validation on a shared build box under a test lease, Node 22: `npm ci --ignore-scripts` with the `wasm-484dc242fbbbeb043262` assets in `dist`, `npm run build:ts`, `vp check --fix` then `git status --porcelain` empty, `npm run check:types`, `npm test`, and a jq check that `"😀a" | match("a").offset` stays 1.
+
+## 2026-11-22: Session disposal has explicit terminal phases
+
+`Session.open` represents its lifecycle as `open`, `closing`, or `closed`.
+Closing rejects new leases and hand connections before they dispatch, including leases that await a runtime reopen.
+Repeated disposal returns the same completion promise, including a failed completion, and does not retry disposal.
+A dispatched failure or retry result remains visible and does not replay the prompt.
+Read-only accessors remain available after disposal.
+
+`client/internal/ToolInput` no longer declares or implements `text`, which has no source caller.
+Its streaming `raw`, `fields`, and `arguments` behavior remains unchanged.
+Compared with 25788d1, ToolInput removes 6 lines and 211 bytes.
+Session adds 20 net lines and 673 bytes, for a production total of 14 net lines and 462 bytes added.
+
+Validation used Node 24.22.3 and npm 11.19.1 on Linux with `SHIPPY_REMOTE_BUILD=0`.
+Every check ran under `unshare -Urn`, with OS networking disabled:
+
+- `npm run check:types` and `npm run build:ts` passed.
+- `node_modules/.bin/vp check src/Session.ts src/client/internal/ToolInput.ts test/session-lifecycle.test.ts` passed without fixes.
+- `node --test test/session-lifecycle.test.ts` passed 23 cases against source and the compiled module.
+- A baseline loader made the shared-disposal regression fail on the previous Session implementation, as expected.
+- A parser differential harness compared 18 inputs across 734 chunk partitions and 2659 prefixes, with 7977 matching assertions.
+- `npm test` includes the lifecycle suite and reported 46 passes, 25 failures, 4 cancellations, and 3 skips. Board checks lacked `dist/nanocode_wasm.wasm`. Postgres checks skipped without a database.
+
+The loaders, differential harness, measurements, and logs remain in ignored `output/maintenance`.
+Coverage counters describe those local mock paths only, not full runtime or E2E coverage.
+The WASM build and release paths were not run for this TypeScript increment.

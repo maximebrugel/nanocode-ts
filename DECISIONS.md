@@ -1157,3 +1157,26 @@ Every check ran under `unshare -Urn`, with OS networking disabled:
 The loaders, differential harness, measurements, and logs remain in ignored `output/maintenance`.
 Coverage counters describe those local mock paths only, not full runtime or E2E coverage.
 The WASM build and release paths were not run for this TypeScript increment.
+
+## 2026-11-22: Portable Python Replay Inputs
+
+`bench/python/replay.ts --snapshot` copies retained HTTP responses and an explicit interpreter/shell profile into one directory under `output/`. Its manifest records every file's size and SHA256, the probe matrix hash and the source revision. Snapshot creation validates response keys, request scope and response hashes. It performs no acquisition. `--bundle` verifies the complete file set before WebAssembly compilation, rejects asset-directory overrides and records the manifest hash in each receipt. The original fixture-directory mode remains available.
+
+The retained capture contains 123 responses, with 315951208 response-body bytes. Its portable bundle contains 249 files with 374485189 bytes, excluding the manifest. The manifest SHA256 is `6e4ad6c9f1bfa321c46e15e5162715af118573ede04779eee0ea4122cff5df1f`. The forty ordered probes retain matrix SHA256 `f07bd0eeb6344c76b827deda0984e140963b1214d22e87d71dd476d43917b208`.
+
+The matched standard assets come from release `build-878f938`, commit `878f938275d47cf636242cd65425562cee0961f3`. The retained archive SHA256, `82a4fd83587fb35d4adda62564e64ec113a987541207a25a9ac3fc201bfa2d96`, matches GitHub's release-asset digest. The module, data and shell SHA256 values are respectively `88d86a29f0ef05ad2853e3407ad40ca81935e4331894a18c914e1052adf2789e`, `2f8f41f879b2b938497ff1066736f3ef0abf6c0235bfc4e44c39b5163dbdd894` and `f16e0a60f2a3e2b3f70d34f22a8e2497fba83cd444ae2da04e63312387848773`.
+
+On hosted Linux with Node 24.22.3, the original replay passed 33/40 once. Three fresh, network-denied bundle processes each passed 33/40, with no changed outcome. Seventeen rejection checks passed for changed content, incomplete or duplicate manifests, unlisted files, changed matrices, directory overrides, overwrite attempts and request-scope violations. These are fixed-case counts, not confidence intervals or broader package qualification.
+
+All seven failures occur during installation. The absent compiled-module counts are statsmodels 26, SciPy 106, scikit-learn 69, lxml 7, cryptography 1, PyArrow 38 and polars-runtime-32 1. No package implementation or probe changed. The historical optional Polars image was not recovered, so its previous 34/40 result is not reproduced here. These retained responses are the interrupted capture, not a claim to recover the earlier historical PyPI snapshot.
+
+The bundle remains an explicit local input, not a committed artifact or a published download. A clean checkout needs the retained bundle and installed npm dependencies. From the source checkout, create a new bundle and run three fresh processes as follows:
+
+```sh
+SHIPPY_REMOTE_BUILD=0 unshare -Urn node bench/python/replay.ts --snapshot output/http output/runtime/878f938/package/dist output/python-replay
+for trial in 1 2 3; do
+  SHIPPY_REMOTE_BUILD=0 unshare -Urn node --max-old-space-size=1024 bench/python/replay.ts --bundle output/python-replay "output/trial-$trial.jsonl" || exit
+done
+```
+
+`npm run check:types`, `npm run build:ts`, standalone strict checking of the replay entrypoint with repository compiler options, focused lint/format checks and `git diff --check` passed. Enabling additional `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess` flags reports 1043 errors in unchanged imported source files, not in the replay entrypoint. Those options are absent from this checkout's tsconfig. No Rust build, model request, wallet call or artifact publication ran. Model-based prose lint was omitted because this work excludes model calls.

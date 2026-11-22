@@ -38,6 +38,30 @@ const alternatives: Record<string, string> = {
   statsmodels: 'numpy and pandas (built in), such as numpy.linalg.lstsq for a regression',
 }
 
+const nativePackages: Record<string, string> = {
+  cryptography: 'cryptography',
+  lxml: 'lxml',
+  polars: 'polars',
+  pyarrow: 'pyarrow',
+  scipy: 'scipy',
+  sklearn: 'scikit-learn',
+  statsmodels: 'statsmodels',
+}
+
+export function unsupportedImport(module: string): string | undefined {
+  const top = module.split('.')[0]!
+  if (!Object.hasOwn(nativePackages, top)) return undefined
+  const name = nativePackages[top]!
+
+  return (
+    name +
+    ' is not supported in nanocode: the native backend required by ' +
+    module +
+    ' is not present in this interpreter' +
+    (alternatives[name] ? '. Instead: ' + alternatives[name] : '')
+  )
+}
+
 const carriedDists: Record<string, [string, string, string]> = {
   contourpy: ['contourpy', 'contourpy', '1.4.0'],
   cycler: ['cycler', 'cycler', '0.12.1'],
@@ -1412,10 +1436,10 @@ async function install(ctx: CommandContext, wanted: string[], flags: Flags): Pro
           proj.info.name +
             ' ' +
             pick.text +
-            " needs compiled modules nanocode's Python does not carry (" +
+            ' is not supported in nanocode: missing target-native implementations (' +
             failure.modules.slice(0, 4).join(', ') +
             (failure.modules.length > 4 ? ', ... ' + failure.modules.length + ' in all' : '') +
-            ') and has no pure-Python fallback; python.wasm ships compiled ' +
+            '); no compatible pure-Python fallback was selected; python.wasm ships compiled ' +
             shippedModules.join(', ') +
             (alternatives[key] ? '. Instead: ' + alternatives[key] : ''),
           1,

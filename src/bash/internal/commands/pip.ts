@@ -1224,6 +1224,8 @@ async function install(ctx: CommandContext, wanted: string[], flags: Flags): Pro
   }
   const warn = (text: string) => ctx.stderr.write('WARNING: ' + text + '\n')
   const present = await installed(ctx.fs)
+  const original = new Map(present)
+  const pending = new Map<string, { top: boolean; unit: Unit }>()
   const modules = await carriedOnce(ctx)
   await stubCarried(ctx, modules, present)
   const queue: { requirement: Requirement; top: boolean }[] = []
@@ -1253,10 +1255,7 @@ async function install(ctx: CommandContext, wanted: string[], flags: Flags): Pro
             )
     const name = fields(unit.metadata, 'Name')[0] ?? unit.distInfo
     const version = fields(unit.metadata, 'Version')[0] ?? ''
-    const have = present.get(normalize(name))
-    if (have) await remove(ctx.fs, have)
-    await place(ctx, unit, true)
-    if (unit.note) warn(name + ': ' + unit.note)
+    pending.set(normalize(name), { top: true, unit })
     present.set(normalize(name), {
       name,
       version,
@@ -1483,16 +1482,20 @@ async function install(ctx: CommandContext, wanted: string[], flags: Flags): Pro
       }
     }
     chosen.set(key, pick.text)
-    if (have) {
-      say('Uninstalling ' + have.name + '-' + have.version)
-      await remove(ctx.fs, have)
-    }
-    await place(ctx, unit, top)
-    if (unit.note) warn(proj.info.name + ': ' + unit.note)
+    pending.set(key, { top, unit })
     done.push(proj.info.name + '-' + pick.text)
     if (flags.deps)
       for (const next of dependencies(fields(unit.metadata, 'Requires-Dist'), requirement.extras))
         queue.push({ requirement: next, top: false })
+  }
+  for (const [key, item] of pending) {
+    const have = original.get(key)
+    if (have) {
+      say('Uninstalling ' + have.name + '-' + have.version)
+      await remove(ctx.fs, have)
+    }
+    await place(ctx, item.unit, item.top)
+    if (item.unit.note) warn(key + ': ' + item.unit.note)
   }
   if (done.length) say('Successfully installed ' + done.join(' '))
   return 0

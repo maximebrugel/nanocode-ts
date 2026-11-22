@@ -709,7 +709,11 @@ async function executeRust(
 const sciModules: readonly string[] = ['polars']
 
 function uncaughtImport(stderr: string): string[] {
-  if (/UserWarning: Polars binary is missing!/.test(stderr)) return ['polars']
+  if (
+    /UserWarning: Polars binary is missing!/.test(stderr) &&
+    /File "[^"]*\/polars\/[^"]+\.py", line \d+/.test(stderr)
+  )
+    return ['polars']
 
   const match = /ModuleNotFoundError: No module named '([A-Za-z_]\w*)[.']\S*\s*$/.exec(stderr)
   return match ? [match[1]!] : []

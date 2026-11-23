@@ -27,9 +27,24 @@ type Call = {
   children?: number
   prefix?: string
   checkpointEvery?: number
+  retain?: Board.Retain | null
 }
 
 type Operation = { count: number; ms: number; errors: number }
+
+const memories: WebAssembly.Memory[] = []
+const instantiate = WebAssembly.instantiate.bind(WebAssembly)
+WebAssembly.instantiate = (async (...args: Parameters<typeof WebAssembly.instantiate>) => {
+  const made = await instantiate(...args)
+  const instance = made instanceof WebAssembly.Instance ? made : made.instance
+  const memory = instance.exports['memory']
+  if (memory instanceof WebAssembly.Memory) memories.push(memory)
+  return made
+}) as typeof WebAssembly.instantiate
+
+const retained = (retain: Board.Retain | null | undefined) => (retain ? { retain } : {})
+
+const wasmBytes = () => memories.at(-1)?.buffer.byteLength ?? 0
 
 const scope = 'swarm'
 const lead = 'lead'
@@ -142,6 +157,7 @@ export class BoardObject extends DurableObject<Env> {
         actor: 'agent:' + actor,
         module: wasm,
         ...(checkpointEvery === undefined ? {} : { checkpointEvery }),
+        ...retained(this.ctx.storage.kv.get<Board.Retain | null>('retain')),
       })
       opened.catch(() => this.boards.delete(actor))
       this.boards.set(actor, opened)
@@ -307,6 +323,7 @@ export class BoardObject extends DurableObject<Env> {
       }
       case 'setup': {
         this.mode = call.mode ?? 'one'
+        this.ctx.storage.kv.put('retain', call.retain ?? null)
         const board = await this.board(lead)
         const granted = await board.grant(
           { can: { '*': ['manage'] }, who: [{ id: 'agent', kind: 'kind' }] },
@@ -321,7 +338,7 @@ export class BoardObject extends DurableObject<Env> {
         const t0 = performance.now()
         const board = await this.board(lead, call.checkpointEvery)
         const openMs = performance.now() - t0
-        return { openMs, opened: await board.opened() }
+        return { openMs, opened: await board.opened(), wasmBytes: wasmBytes() }
       }
       case 'drop_checkpoints':
         this.ctx.storage.sql.exec('DELETE FROM nanocode_checkpoint')
@@ -332,7 +349,7 @@ export class BoardObject extends DurableObject<Env> {
         const board = await this.board(lead)
         const t0 = performance.now()
         const tasks = await board.tasks()
-        return { count: tasks.length, tasksMs: performance.now() - t0 }
+        return { count: tasks.length, tasksMs: performance.now() - t0, wasmBytes: wasmBytes() }
       }
       case 'post': {
         const board = await this.board(lead)

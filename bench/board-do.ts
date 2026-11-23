@@ -31,6 +31,7 @@ import type { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { rolldown } from 'rolldown'
 import workerdModule from 'workerd'
+import type { Board } from '../src/index.ts'
 
 // workerd is CommonJS with a default export, which Node's ESM interop wraps once more.
 const workerd: string =
@@ -52,6 +53,7 @@ type Config = {
   modes: Mode[]
   phases: string[]
   restarts: number
+  retain: Board.Retain | null
   seed: number
   sizes: number[]
   steer: number
@@ -95,6 +97,7 @@ function parse(argv: readonly string[]): Config {
     modes: modes as Mode[],
     phases: (flags.get('phases') ?? 'load,replay').split(','),
     restarts: number('restarts', 5),
+    retain: JSON.parse(flags.get('retain') ?? 'null') as Board.Retain | null,
     seed: number('seed', 1),
     sizes: list('sizes', '1000,2500,5000,10000,25000,50000'),
     steer: number('steer', 0.02),
@@ -466,7 +469,7 @@ function diskBytes(path: string): number {
 
 async function replay(config: Config) {
   const object = 'replay-' + Date.now()
-  await send(object, { method: 'setup', mode: 'one' })
+  await send(object, { method: 'setup', mode: 'one', retain: config.retain })
   const diskBefore = diskBytes(storage)
   const points = []
   let written = 0
@@ -509,6 +512,8 @@ async function replay(config: Config) {
         warm: [] as number[],
         write: [] as number[],
         total: [] as number[],
+        wasmOpen: [] as number[],
+        wasmRead: [] as number[],
       }
       let tasks = 0
       for (let index = 0; index < config.restarts; index++) {
@@ -517,7 +522,7 @@ async function replay(config: Config) {
         wake.abort.push(restarted.abortMs)
         wake.boot.push(restarted.bootMs)
         const t0 = performance.now()
-        const open = await send<{ openMs: number; opened: unknown }>(object, {
+        const open = await send<{ openMs: number; opened: unknown; wasmBytes: number }>(object, {
           method: 'open',
           checkpointEvery,
         })
@@ -527,7 +532,11 @@ async function replay(config: Config) {
         // The new instance's SQL time so far is the open's log read; the rest of the open is the fold.
         const read = (await send<Operations>(object, { method: 'operations' })).value
         steps.readSql.push(Object.values(read).reduce((sum, entry) => sum + entry.ms, 0))
-        const first = await send<{ count: number; tasksMs: number }>(object, { method: 'tasks' })
+        const first = await send<{ count: number; tasksMs: number; wasmBytes: number }>(object, {
+          method: 'tasks',
+        })
+        steps.wasmOpen.push(open.value.wasmBytes)
+        steps.wasmRead.push(first.value.wasmBytes)
         steps.first.push(first.wallMs)
         steps.firstInside.push(first.value.tasksMs)
         tasks = first.value.count
@@ -559,6 +568,7 @@ async function replay(config: Config) {
       const disk = diskBytes(storage) - diskBefore
       const point = {
         checkpoints,
+        retain: config.retain,
         opened,
         bodyBytes: audit.bodyBytes,
         databaseSize: audit.databaseSize,
@@ -585,6 +595,8 @@ async function replay(config: Config) {
           openMs: round(median(wake.open)),
           openSamples: wake.open.map((ms) => round(ms, 1)),
           totalMs: round(median(steps.total)),
+          wasmMiBAtOpen: round(median(steps.wasmOpen) / 2 ** 20),
+          wasmMiBAfterRead: round(median(steps.wasmRead) / 2 ** 20),
           warmReadMs: round(median(steps.warm)),
           writeMs: round(median(steps.write)),
         },

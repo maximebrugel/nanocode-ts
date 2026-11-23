@@ -1041,6 +1041,7 @@ async fn log(scope: &str) -> Result<Arc<Log>, String> {
             retain_finished: RETAIN_FINISHED.get(),
             snapshot_ratio: 2,
             snapshot_rows: Some(128),
+            ..Policy::default()
         },
     )
     .await

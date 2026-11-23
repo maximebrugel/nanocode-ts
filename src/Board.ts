@@ -135,6 +135,16 @@ export type Options = {
   // Events a partition folds past its last fold checkpoint before it saves another (4096 by
   // default); 0 saves none on its own, though checkpoint() and close() still save one.
   checkpointEvery?: number
+  retain?: Retain
+}
+
+export type Retain = {
+  settled: number
+  entries: number
+  only?: [string, string]
+  events?: number
+  gone?: number
+  labelEvents?: [string, string, number]
 }
 
 export type MemorySql = Contracts.SqlHost & { close(): void }
@@ -223,6 +233,7 @@ export async function open(options: Options): Promise<Board> {
         ...(options.checkpointEvery === undefined
           ? {}
           : { checkpoint_every: options.checkpointEvery }),
+        ...(options.retain === undefined ? {} : { retain: retention(options.retain) }),
       },
     })) as number
     const opened = wrap(runtime, board, options, reach)
@@ -239,6 +250,17 @@ export async function open(options: Options): Promise<Board> {
   } catch (error) {
     await runtime.dispose()
     throw error
+  }
+}
+
+function retention(retain: Retain) {
+  return {
+    settled: retain.settled,
+    entries: retain.entries,
+    only: retain.only ?? null,
+    events: retain.events ?? 0,
+    gone: retain.gone ?? 0,
+    label_events: retain.labelEvents ?? null,
   }
 }
 

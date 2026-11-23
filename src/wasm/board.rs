@@ -2,12 +2,13 @@ use std::{cell::RefCell, collections::BTreeMap, num::NonZeroU32, sync::Arc};
 
 use nanocode::turnlog::{LogHost, SqlLog};
 use nanocode_board::{
-    Applied, Board, BoardError, Cap, ClaimId, Op, Phase, Rejection, Task, TaskId,
+    Applied, Board, BoardError, Cap, ClaimId, Fold, Op, Phase, Rejection, Retain, Task, TaskId,
     access::{Identity, Verifier},
-    checkpoint::{Fallback, Opened},
+    checkpoint::{self as checkpoints, Fallback, Opened},
     shards::{self, Merged, Route},
     steer::Steer,
 };
+use nanocode_partitions::Partition;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -41,6 +42,8 @@ pub(crate) enum Request {
         /// none on its own. Unset keeps nanocode's default.
         #[serde(default)]
         checkpoint_every: Option<u64>,
+        #[serde(default)]
+        retain: Option<Retain>,
     },
     Opened {
         board: u32,
@@ -121,12 +124,11 @@ pub(crate) async fn execute(request: Request) -> Result<Value, String> {
             partitions,
             scope,
             checkpoint_every,
+            retain,
         } => {
             // Each Board.open instantiates its own module, so this setting is this board's.
-            if let Some(events) = checkpoint_every {
-                nanocode_board::checkpoint::checkpoint_every(events);
-            }
-            open(&scope, &actor, partitions).await
+            checkpoints::checkpoint_every(checkpoint_every.unwrap_or(checkpoints::CHECKPOINT_EVERY));
+            open(&scope, &actor, partitions, retain).await
         }
         Request::Opened { board } => BOARDS.with_borrow(|boards| {
             let boards = boards
@@ -211,7 +213,12 @@ pub(crate) async fn execute(request: Request) -> Result<Value, String> {
     }
 }
 
-async fn open(scope: &str, actor: &str, partitions: NonZeroU32) -> Result<Value, String> {
+async fn open(
+    scope: &str,
+    actor: &str,
+    partitions: NonZeroU32,
+    retain: Option<Retain>,
+) -> Result<Value, String> {
     let (principal, profile) = match actor.split_once('+') {
         Some((principal, profile)) => (principal, Some(profile)),
         None => (actor, None),
@@ -223,9 +230,15 @@ async fn open(scope: &str, actor: &str, partitions: NonZeroU32) -> Result<Value,
         })
         .map_err(|denied| format!("{actor}: {denied:?}"))?;
     let host: Arc<dyn LogHost> = Arc::new(SqlLog::new(Arc::new(WorkerStore::log())));
-    let boards = shards::open(&host, scope, partitions, &identity)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut boards = Vec::with_capacity(partitions.get() as usize);
+    for index in 0..partitions.get() {
+        let fold = retain.clone().map_or_else(Fold::new, Fold::retaining);
+        let scope = shards::scope_of(scope, partitions, Partition(index));
+        let board = Board::open_into(Arc::clone(&host), &scope, identity.clone(), fold)
+            .await
+            .map_err(|error| error.to_string())?;
+        boards.push(board);
+    }
     let saved = boards
         .iter()
         .map(|board| match board.opened() {

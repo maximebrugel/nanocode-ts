@@ -295,6 +295,7 @@ dependencies = [
  "nanocode-backend-antigravity",
  "nanocode-backend-claude",
  "nanocode-backend-codex",
+ "nanocode-backend-kimi",
  "nanocode-code-mode",
  "nanocode-computer",
  "nanocode-durability",
@@ -565,6 +566,35 @@ dependencies = [
  "nanocode-url",
  "nanocode-websocket",
  "nanocode-zstd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-backend-kimi"
+version = "0.7.0"
+dependencies = [
+ "nanocode-agent-config",
+ "nanocode-agent-core",
+ "nanocode-backend-kimi-client",
+ "nanocode-durability",
+ "nanocode-platform",
+ "nanocode-sync",
+ "nanocode-tool-contracts",
+ "nanocode-tool-host",
+ "nanocode-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-backend-kimi-client"
+version = "0.7.0"
+dependencies = [
+ "nanocode-http",
+ "nanocode-platform",
+ "nanocode-sync",
+ "nanocode-tls",
  "serde",
  "serde_json",
 ]
